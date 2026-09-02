@@ -52,8 +52,10 @@ OPENING_GRACE_SECONDS = 3.0
 FIRE_BUSY_STEP = 0.005
 FIRST_PASS_WAIT_RANGE = (0.05, 0.15)
 RETRY_WAIT_RANGE = (0.3, 0.6)
-# How many candidate seats submit simultaneously at the opening moment.
-PARALLEL_SEAT_LIMIT = 4
+# How many candidate seats submit simultaneously at the opening moment. The
+# web UI caps a plan's candidate pool at the same number, so a full pool can
+# be covered by one all-at-once volley.
+PARALLEL_SEAT_LIMIT = 6
 _NOTIFY_STATUSES = {"SUCCESS", "FAILED", "SKIPPED", "NEEDS_VERIFICATION", "BLOCKED_BY_RISK"}
 _executor = ThreadPoolExecutor(max_workers=MAX_ACCOUNT_WORKERS, thread_name_prefix="reserve")
 _account_locks: dict[int, threading.Lock] = {}
@@ -386,12 +388,15 @@ def _parallel_opening_shot(
 ):
     """Opening-moment race: one dense poller, then every candidate submits.
 
-    The poller detects the switch; each racer then resolves its own fresh page
-    on a cloned session (one GET, in parallel) and submits its seat the moment
-    the server clock allows. First success stops the rest. Returns
-    ``(outcomes, winner)`` where outcomes audit every racer and winner is the
-    successful outcome dict, or ``( [], None )`` when the window never opened
-    and the serial fallback must take over.
+    Racers are cloned *before* the window and each warms its own keep-alive
+    connection with one cheap GET on the exact decisive URL, so the opening
+    moment pays no DNS/TCP/TLS handshake. When the poller detects the switch
+    it passes the verified select context to every racer, which then runs the
+    shortest possible path: one redirect-following GET on that context plus
+    the submit POST — no fallback chain, no context discovery. First success
+    stops the rest. Returns ``(outcomes, winner)`` where outcomes audit every
+    racer and winner is the successful outcome dict, or ``([], None)`` when
+    the window never opened and the serial fallback must take over.
     """
     room_id = request_values["room_id"]
     start_time = request_values["start_time"]
@@ -400,34 +405,55 @@ def _parallel_opening_shot(
     select_path = request_values["select_context_path"]
     select_source = request_values["select_context_source"]
     workers = seats[:PARALLEL_SEAT_LIMIT]
-
-    pre = _poll_until_open(client, fire_epoch, request_values, target_day)
-    if pre is None:
-        return [], None
+    verified_context = dict(select_params or {"id": room_id.strip()})
+    opened = threading.Event()
 
     outcomes: list[dict] = []
     winner: dict | None = None
     guard = threading.Lock()
     stop = threading.Event()
 
-    def race(seat: str) -> None:
+    def race(seat: str, racer: ChaoxingClient) -> None:
         nonlocal winner
+        # 1) Arrive at the lead window, then warm DNS/TCP/TLS with one cheap
+        #    GET on the exact decisive URL — late enough that the pooled
+        #    connection is still hot milliseconds later at the switch.
+        while True:
+            remaining = fire_epoch - app_clock.server_now()
+            if remaining <= PREFETCH_LEAD_SECONDS:
+                break
+            time.sleep(min(remaining - PREFETCH_LEAD_SECONDS, 0.2))
+        try:
+            racer.fetch_target_day_page(target_day, dict(verified_context), select_path)
+        except Exception:
+            pass  # warm-up must never break the race itself
+        if not opened.wait(timeout=max(0.0, deadline - time.monotonic())):
+            return  # poller never saw the window; the serial fallback owns this
         if stop.is_set():
             return
-        racer = client.clone_authenticated()
+        # 2) Shortest path: one GET on the poller-verified context. Only an
+        #    unusable answer falls back to the full resolver chain.
         resolved = None
         try:
-            resolved = racer.resolve_submission_page(
-                room_id, seat, target_day,
-                select_params=select_params, select_path=select_path, select_source=select_source,
-            )
-        except ReservationError:
-            resolved = None
+            fast = racer.fetch_target_day_page(target_day, dict(verified_context), select_path)
+            if fast is not None and (fast.ok or fast.captcha_type in CAPTCHA_TYPES):
+                resolved = fast
+        except Exception:
+            resolved = None  # any surprise falls back to the full resolver
+        if resolved is None:
+            try:
+                resolved = racer.resolve_submission_page(
+                    room_id, seat, target_day,
+                    select_params=select_params, select_path=select_path, select_source=select_source,
+                )
+            except ReservationError:
+                resolved = None
         if resolved is None:
             # Last resort: the poller's page may still carry a usable token.
-            if not (pre is not None and pre.ok and pre.captcha_type not in CAPTCHA_TYPES):
+            page = pre_holder.get("page")
+            if page is None or not page.ok or page.captcha_type in CAPTCHA_TYPES:
                 return
-            resolved = pre
+            resolved = page
         _hold_until_fire(fire_epoch)
         if stop.is_set():
             return
@@ -452,9 +478,23 @@ def _parallel_opening_shot(
                 winner = outcomes[-1]
                 stop.set()
 
-    threads = [threading.Thread(target=race, args=(seat,), name=f"opening-{seat}", daemon=True) for seat in workers]
+    threads = [
+        threading.Thread(target=race, args=(seat, client.clone_authenticated()), name=f"opening-{seat}", daemon=True)
+        for seat in workers
+    ]
     for thread in threads:
         thread.start()
+
+    # 3) The single dense poller watches for the window; racers hold until it
+    #    fires (or the window never opens and the serial fallback takes over).
+    pre = _poll_until_open(client, fire_epoch, request_values, target_day)
+    pre_holder: dict = {"page": None}
+    if pre is None:
+        stop.set()
+        opened.set()  # wake racers so they exit on the stop check
+        return [], None
+    pre_holder["page"] = pre
+    opened.set()
     for thread in threads:
         thread.join(timeout=max(0.0, deadline - time.monotonic()))
     return outcomes, winner

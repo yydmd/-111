@@ -644,6 +644,8 @@ def test_parallel_opening_shot_records_racers_and_first_winner(tmp_path, monkeyp
         def login(self): pass
         def browse(self, *args, **kwargs): pass
         def clone_authenticated(self): return FakeClient()
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
         def resolve_submission_page(self, *args, **kwargs):
             return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
         def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):

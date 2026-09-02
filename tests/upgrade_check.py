@@ -116,6 +116,8 @@ def scenario_budget_clamp() -> None:
 def scenario_parallel_winner() -> None:
     factory = make_factory(DATA, "uc-parallel")
     plan_id = make_plan(factory, seats=("001", "002"), max_attempts=3)
+    fast_fetches: list[str] = []
+    slow_resolves: list[str] = []
 
     class Client:
         def __init__(self, *args, **kwargs):
@@ -125,7 +127,11 @@ def scenario_parallel_winner() -> None:
         def login(self): pass
         def browse(self, *args, **kwargs): pass
         def clone_authenticated(self): return Client()
+        def fetch_target_day_page(self, day, params, select_path=None):
+            fast_fetches.append("fetch")
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
         def resolve_submission_page(self, *args, **kwargs):
+            slow_resolves.append("resolve")
             return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
         def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
             self.last_submitted = True
@@ -144,8 +150,16 @@ def scenario_parallel_winner() -> None:
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     check("parallel-success", run.status == "SUCCESS", f"status={run.status}")
     check("parallel-winner-seat", run.selected_seat == "002", f"seat={run.selected_seat}")
-    check("parallel-audit-both", {item["seat"] for item in run.attempt_details} == {"001", "002"},
-          f"details={[i['seat'] for i in run.attempt_details]}")
+    # Shortest path: every racer rode the single-GET fetch; the full resolver
+    # chain (redirects / context discovery) must never run at the opening.
+    check("parallel-shortest-path", len(fast_fetches) >= 2 and not slow_resolves,
+          f"fast={len(fast_fetches)} slow={len(slow_resolves)}")
+    check("parallel-limit-six", service.PARALLEL_SEAT_LIMIT == 6, str(service.PARALLEL_SEAT_LIMIT))
+    # First winner stops the rest: a loser may be cancelled before its submit,
+    # so the audit must contain the winner and only known racers.
+    seats_audited = {item["seat"] for item in run.attempt_details}
+    check("parallel-audit-racers", "002" in seats_audited and seats_audited <= {"001", "002"},
+          f"details={sorted(seats_audited)}")
     db.close()
 
 
