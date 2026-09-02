@@ -181,7 +181,9 @@ def _persist_discovered_context(plan: ReservationPlan, client: ChaoxingClient) -
     # discovery, however, must be allowed to refresh an older stored automatic
     # path/parameter set (including the historic absolute-URL bug).
     automatic_sources = {"auto_context", "room_context", "stored_auto_context"}
-    if params and (not plan.select_params or source in automatic_sources):
+    stored_source = (plan.select_context_source or "").strip()
+    manual_override = bool(plan.select_params) and stored_source not in automatic_sources
+    if params and not manual_override and (not plan.select_params or source in automatic_sources):
         plan.select_params_json = json.dumps(params, ensure_ascii=False)
         plan.select_context_source = "auto_context" if source == "stored_auto_context" else (source or "auto_context")
         plan.select_context_path = path
@@ -267,6 +269,37 @@ def _verify_duplicate_on_server(client: ChaoxingClient, request_values: dict, ta
     if match is None:
         return "absent", ""
     return "found", _server_reservation_brief(match)
+
+
+def _reconcile_parallel_successes(client: ChaoxingClient, request_values: dict, target_day: dt.date, success_seats: list[str]) -> str:
+    """Describe what the platform actually holds after a multi-success volley.
+
+    Parallel racers submit simultaneously; the stop flag can only take effect
+    for racers that had not reached their POST yet, so several candidates may
+    have succeeded at once. The run keeps the first winner, but the record
+    must tell the user which seats the platform really holds — especially
+    stray duplicates that need manual cancellation.
+    """
+    try:
+        reservations = client.fetch_reservations(request_values.get("select_params"), request_values.get("select_context_path"))
+        overlapping = _chaoxing_client.ChaoxingClient.find_overlapping_reservations(
+            reservations, target_day, request_values["room_id"], request_values["start_time"], request_values["end_time"]
+        )
+    except Exception:  # reconciliation must never break the success path
+        return "未能核实超星端实际持有的预约，请到超星端检查是否有重复预约"
+
+    def norm_seat(value) -> str:
+        raw = str(value or "").strip()
+        return raw.zfill(3) if raw.isdigit() else raw
+
+    held = {norm_seat(item.get("seatNum")) for item in overlapping}
+    strays = [seat for seat in success_seats if norm_seat(seat) in held]
+    if strays:
+        held_display = "、".join(sorted(held)) if held else "、".join(strays)
+        return f"经核实超星端同时持有 {held_display} 多个座位，请手动取消多余的预约"
+    if held:
+        return "经核实超星端仅保留一个本场次预约"
+    return "经核实超星端当前没有本场次预约，请到超星端确认"
 
 
 def _failure_status(code: str) -> str:
@@ -795,7 +828,42 @@ def execute_plan(
                         run.parameter_source = winner["source"]
                         run.status = "SUCCESS"
                         run.error_code = None
-                        run.message = redact(f"座位 {winner['seat']}：{winner['message']}")
+                        summary = f"座位 {winner['seat']}：{winner['message']}"
+                        extra_successes = sorted({outcome["seat"] for outcome in parallel_outcomes if outcome["code"] is None and outcome["seat"] != winner["seat"]})
+                        if extra_successes:
+                            # The volley is simultaneous by design: the stop flag
+                            # only reaches racers that had not POSTed yet, so a
+                            # second seat may have succeeded too. Verify what the
+                            # platform really holds instead of hiding it.
+                            summary += f"；并行提交的座位 {'、'.join(extra_successes)} 同样返回成功，{_reconcile_parallel_successes(client, request_values, target_day, extra_successes)}"
+                        run.message = redact(summary)
+                        return run.id
+                    unknown = next((outcome for outcome in parallel_outcomes if outcome["code"] == "SUBMIT_OUTCOME_UNKNOWN"), None)
+                    if unknown is not None:
+                        # A racer's POST may have reached the platform even
+                        # though its response was lost. Mirror the serial
+                        # path: verify on the server, then stop — the serial
+                        # fallback must never re-submit this slot.
+                        state, detail = _verify_duplicate_on_server(client, request_values, target_day)
+                        if state == "found":
+                            _persist_discovered_context(plan, client)
+                            run.selected_seat = unknown["seat"]
+                            run.parameter_source = unknown["source"]
+                            run.status = "SUCCESS"
+                            run.error_code = None
+                            run.message = redact(f"座位 {unknown['seat']}：提交响应丢失，经超星端核实预约已生效（{detail}）")
+                            return run.id
+                        if detail:
+                            messages.append(f"自动核实：{detail}")
+                        _set_failure(run, "SUBMIT_OUTCOME_UNKNOWN", "; ".join(messages), status="NEEDS_VERIFICATION")
+                        return run.id
+                    fatal = next((outcome["code"] for outcome in reversed(parallel_outcomes) if outcome["code"] and outcome["code"] not in _RETRYABLE_CODES), None)
+                    if fatal is not None:
+                        # A racer was rejected for a non-retryable reason (risk
+                        # control, captcha, login, deadline). The serial path
+                        # stops immediately on such codes; the volley's verdict
+                        # gets the same respect — no more submissions.
+                        _set_failure(run, fatal, "; ".join(messages), status=_failure_status(fatal))
                         return run.id
                 else:
                     pre_resolved = _await_fire_and_prefetch(client, fire_epoch, request_values, target_day, seats[0])
@@ -806,6 +874,9 @@ def execute_plan(
         # it. The parallel opening shot may already have consumed candidates.
         dead_seats = {outcome["seat"] for outcome in parallel_outcomes if outcome["code"] == "SEAT_UNAVAILABLE"}
         used_attempts = sum(1 for outcome in parallel_outcomes if outcome["submitted"])
+        # Remember the most recent failure code so an exhausted budget is
+        # reported with its real cause instead of a blanket "seat taken".
+        last_code: str | None = next((outcome["code"] for outcome in reversed(parallel_outcomes) if outcome["code"]), None)
         for attempt in range(used_attempts, attempts):
             if time.monotonic() >= deadline:
                 raise ReservationError("DEADLINE_EXCEEDED", "任务超过 60 秒运行上限")
@@ -835,6 +906,7 @@ def execute_plan(
                 run.message = redact(f"座位 {seat}：{message}")
                 return run.id
             except ReservationError as exc:
+                last_code = exc.code
                 source = getattr(client, "last_parameter_source", "") or "unknown"
                 _persist_discovered_context(plan, client)
                 run.parameter_source = source
@@ -871,7 +943,8 @@ def execute_plan(
                     break  # every candidate confirmed taken; stop hammering
                 _set_failure(run, exc.code, "; ".join(messages), status=_failure_status(exc.code))
                 return run.id
-        _set_failure(run, "SEAT_UNAVAILABLE", "; ".join(messages) or "所有候选座位均不可预约")
+        final_code = last_code or "SEAT_UNAVAILABLE"
+        _set_failure(run, final_code, "; ".join(messages) or "所有候选座位均不可预约", status=_failure_status(final_code))
         return run.id
     except ReservationError as exc:
         if run is None:

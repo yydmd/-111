@@ -670,8 +670,11 @@ def test_parallel_opening_shot_records_racers_and_first_winner(tmp_path, monkeyp
     assert run.status == "SUCCESS"
     assert run.selected_seat == "002"
     assert "预约成功" in run.message
-    assert len(run.attempt_details) == 2
-    assert {item["seat"] for item in run.attempt_details} == {"001", "002"}
+    # First winner stops the rest: a loser may be cancelled before its submit,
+    # so the audit must contain the winner and only known racers.
+    seats_audited = {item["seat"] for item in run.attempt_details}
+    assert "002" in seats_audited
+    assert seats_audited <= {"001", "002"}
     db.close()
 
 
@@ -1173,3 +1176,271 @@ def test_legacy_debug_loads_its_runtime_in_non_action_mode(monkeypatch):
         action=False,
     )
     assert ("submit", ["08:00", "09:00"], "100", ["001"], False) in calls
+
+
+def test_manual_override_context_survives_auto_discovery_fallback(tmp_path):
+    """Bug 1 回归：手动保存的高级覆盖链接不能被自动发现的结果覆写。"""
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("001",), max_attempts=1)
+    db = factory()
+    plan = db.get(ReservationPlan, plan_id)
+    plan.select_params_json = json.dumps({"id": "100", "deptIdEnc": "MANUAL"})
+    plan.select_context_source = "advanced_manual"
+    plan.select_context_path = "/front/third/apps/seat/select"
+    db.commit()
+    client = type("Client", (), {
+        "last_discovered_select_params": {"id": "100"},
+        "last_parameter_source": "auto_context",
+        "last_discovered_select_path": "/front/apps/seat/select",
+    })()
+    service._persist_discovered_context(plan, client)
+    assert plan.select_params == {"id": "100", "deptIdEnc": "MANUAL"}
+    assert plan.select_context_source == "advanced_manual"
+    assert plan.select_context_path == "/front/third/apps/seat/select"
+    assert plan.select_context_checked_at is not None
+    db.close()
+
+
+def _volley_test_factory(submits, code, message):
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self):
+            pass
+
+        def browse(self, *args, **kwargs):
+            pass
+
+        def clone_authenticated(self):
+            return FakeClient()
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            submits.append(seat)
+            self.last_submitted = True
+            raise ReservationError(code, message)
+
+    return FakeClient
+
+
+def _run_volley_plan(tmp_path, monkeypatch, fake_client, seats, max_attempts):
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=seats, max_attempts=max_attempts)
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    monkeypatch.setattr(service, "ChaoxingClient", fake_client)
+    monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "notify_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_scheduled_fire_epoch", lambda _plan: time.time())
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    monkeypatch.setattr(service, "_hold_until_fire", lambda *_args, **_kwargs: None)
+    service.execute_plan(plan_id, trigger="scheduled")
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    result = (run.status, run.error_code)
+    db.close()
+    return result
+
+
+def test_volley_exhaustion_reports_real_failure_code(tmp_path, monkeypatch):
+    """Bug 2 回归：并行开抢预算耗尽时保留真实失败码，不再误标为座位不可预约。"""
+    submits: list[str] = []
+    fake = _volley_test_factory(submits, "BLOCKED_BY_RISK", "平台限流（HTTP 429）")
+    status, error_code = _run_volley_plan(tmp_path, monkeypatch, fake, seats=("001", "002", "003"), max_attempts=3)
+    assert sorted(submits) == ["001", "002", "003"]
+    assert (status, error_code) == ("BLOCKED_BY_RISK", "BLOCKED_BY_RISK")
+
+
+def test_volley_outcome_unknown_stops_instead_of_resubmitting(tmp_path, monkeypatch):
+    """Bug 2 回归：响应丢失的并行提交不得由串行兜底重复提交。"""
+    import app.service as service
+
+    submits: list[str] = []
+    verify_calls: list[str] = []
+
+    def fake_verify(client, request_values, target_day):
+        verify_calls.append("called")
+        return "unavailable", "核实失败（测试）"
+
+    monkeypatch.setattr(service, "_verify_duplicate_on_server", fake_verify)
+    fake = _volley_test_factory(submits, "SUBMIT_OUTCOME_UNKNOWN", "提交请求已发出，但未能确认超星端结果")
+    status, error_code = _run_volley_plan(tmp_path, monkeypatch, fake, seats=("001", "002", "003"), max_attempts=3)
+    # 每个 racer 只提交一次；串行兜底绝不再提交同一个时段。
+    assert sorted(submits) == ["001", "002", "003"]
+    assert verify_calls == ["called"]
+    assert (status, error_code) == ("NEEDS_VERIFICATION", "SUBMIT_OUTCOME_UNKNOWN")
+
+
+def test_volley_non_retryable_failure_stops_serial_fallback(tmp_path, monkeypatch):
+    """修复回归：并行阶段遭遇风控/验证码等非重试失败后，串行兜底不得再次提交。"""
+    submits: list[str] = []
+    fake = _volley_test_factory(submits, "CAPTCHA_REQUIRED", "检测到滑块验证码，需要人工处理")
+    status, error_code = _run_volley_plan(tmp_path, monkeypatch, fake, seats=("001", "002"), max_attempts=6)
+    assert sorted(submits) == ["001", "002"]  # 只有并行 volley 的两次提交
+    assert (status, error_code) == ("NEEDS_VERIFICATION", "CAPTCHA_REQUIRED")
+
+
+def test_volley_retryable_failures_still_use_serial_fallback(tmp_path, monkeypatch):
+    """修复回归：可重试码（座位占用/参数未取得）仍按原设计进入串行轮转。"""
+    import app.service as service
+
+    monkeypatch.setattr(service.time, "sleep", lambda *_: None)
+    submits: list[str] = []
+    codes = {"001": "SEAT_UNAVAILABLE", "002": "TARGET_CONTEXT_UNAVAILABLE"}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self):
+            pass
+
+        def browse(self, *args, **kwargs):
+            pass
+
+        def clone_authenticated(self):
+            return FakeClient()
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            submits.append(seat)
+            self.last_submitted = True
+            raise ReservationError(codes[seat], "occupied" if seat == "001" else "未取得目标日期预约参数")
+
+    status, error_code = _run_volley_plan(tmp_path, monkeypatch, FakeClient, seats=("001", "002"), max_attempts=6)
+    # 串行循环继续轮转：001 已死不再提交，002 继续消耗剩余预算。
+    assert submits.count("001") == 1
+    assert submits.count("002") > 1
+    assert (status, error_code) == ("FAILED", "TARGET_CONTEXT_UNAVAILABLE")
+
+
+def test_volley_multiple_successes_are_reconciled_on_server(tmp_path, monkeypatch):
+    """修复回归：多个座位并行提交都成功时，收尾核对超星端实际持有的预约。"""
+    tz = ZoneInfo("Asia/Shanghai")
+    target = (datetime.now(tz).date() + timedelta(days=1)).isoformat()
+
+    def epoch_ms(hour: int, minute: int) -> int:
+        moment = datetime.fromisoformat(f"{target}T{hour:02d}:{minute:02d}:00").replace(tzinfo=tz)
+        return int(moment.timestamp() * 1000)
+
+    reservations = [
+        {"roomId": "100", "today": target, "startTime": epoch_ms(8, 0), "endTime": epoch_ms(9, 0), "seatNum": seat}
+        for seat in ("001", "002")
+    ]
+    submits: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self):
+            pass
+
+        def browse(self, *args, **kwargs):
+            pass
+
+        def clone_authenticated(self):
+            return FakeClient()
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def fetch_reservations(self, select_params=None, select_path=None):
+            return reservations
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            # Simulate real POST latency: without it the first winner can set
+            # the stop flag before the second racer passes its pre-submit
+            # check, which would hide the multi-success race this test pins.
+            time.sleep(0.02)
+            submits.append(seat)
+            self.last_submitted = True
+            return "预约成功"
+
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("001", "002"), max_attempts=2)
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
+    monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "notify_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_scheduled_fire_epoch", lambda _plan: time.time())
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    monkeypatch.setattr(service, "_hold_until_fire", lambda *_args, **_kwargs: None)
+    service.execute_plan(plan_id, trigger="scheduled")
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    assert sorted(submits) == ["001", "002"]
+    assert run.status == "SUCCESS"
+    assert run.selected_seat in {"001", "002"}
+    assert "同样返回成功" in run.message
+    assert "手动取消多余的预约" in run.message
+    assert len(run.attempt_details) == 2
+    db.close()
+
+
+def test_input_fields_rejects_unrelated_values_as_algorithm_salt():
+    """Bug 3 回归：歧义页面的无关输入值不得被当作签名盐。"""
+    from app.chaoxing_client import _input_fields
+
+    ambiguous = (
+        '<input id="submit_enc" value="TOKEN123">'
+        '<input name="keyword" value="搜索词">'
+        '<input type="hidden" name="csrf" value="ABC">'
+    )
+    assert _input_fields(ambiguous) == ("TOKEN123", "")
+    assert _input_fields('<input id="submit_enc" value="tok">') == ("tok", "tok")
+    assert _input_fields('<input id="algorithm" value="algo"><input id="submit_enc" value="tok">') == ("tok", "algo")
+
+
+def test_select_url_discovery_keeps_query_values_containing_s():
+    """Bug 4 回归：页面文本中发现的选座链接，查询串含 s/S 时不得被截断。"""
+    html = "跳转 https://office.chaoxing.com/front/third/apps/seat/select?id=100&deptIdEnc=abcSdef 继续"
+    response = type("Response", (), {
+        "content": html.encode(),
+        "text": html,
+        "url": "https://office.chaoxing.com/front/third/apps/seat/code?id=100&seatNum=001",
+    })()
+    discovered = ChaoxingClient._select_context_from_response(response, "100")
+    assert discovered is not None
+    assert discovered[0]["deptIdEnc"] == "abcSdef"
+
+
+def test_submit_once_past_deadline_is_not_audited_as_submitted():
+    """次要修复回归：超限后未发出的请求不得记为已提交。"""
+    client = ChaoxingClient("u", "p", deadline=time.monotonic() - 1)
+    probe = ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+    with pytest.raises(ReservationError) as exc_info:
+        client.submit_once("100", "001", "08:00", "09:00", date(2026, 9, 3), pre_resolved=probe)
+    assert exc_info.value.code == "DEADLINE_EXCEEDED"
+    assert client.last_submitted is False

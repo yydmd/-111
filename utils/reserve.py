@@ -1,4 +1,4 @@
-from utils import AES_Encrypt, enc, generate_captcha_key, verify_param
+from utils import AES_Encrypt, generate_captcha_key, verify_param
 import json
 import requests
 import re
@@ -6,13 +6,6 @@ import time
 import logging
 import datetime
 from urllib3.exceptions import InsecureRequestWarning
-
-
-def get_date(day_offset: int = 0):
-    today = datetime.datetime.now().date()
-    offset_day = today + datetime.timedelta(days=day_offset)
-    tomorrow = offset_day.strftime("%Y-%m-%d")
-    return tomorrow
 
 
 class reserve:
@@ -32,12 +25,8 @@ class reserve:
         self.submit_url = "https://office.chaoxing.com/data/apps/seat/submit"
         self.seat_url = "https://office.chaoxing.com/data/apps/seat/getusedtimes"
         self.login_url = "https://passport2.chaoxing.com/fanyalogin"
-        self.token = ""
-        self.success_times = 0
-        self.fail_dict = []
         self.submit_msg = []
         self.requests = requests.session()
-        self.token_pattern = re.compile("token = '(.*?)'")
         self.headers = {
             "Referer": "https://office.chaoxing.com/",
             "Host": "captcha.chaoxing.com",
@@ -61,7 +50,6 @@ class reserve:
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.3 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1 wechatdevtools/1.05.2109131 MicroMessenger/8.0.5 Language/zh_CN webview/16364215743155638",
             "X-Requested-With": "XMLHttpRequest",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Host": "passport2.chaoxing.com",
         }
 
         self.sleep_time = sleep_time
@@ -74,43 +62,65 @@ class reserve:
     def _get_page_token(self, url, require_value=False):
         response = self.requests.get(url=url, verify=False)
         html = response.content.decode("utf-8")
-        # matches = re.findall(r"token = \'(.*?)\'", html)
-        matches = re.findall(r'id="submit_enc"\s+value="(.*?)"', html)
+        # Attribute order on the page is not guaranteed; accept both.
+        matches = (
+            re.findall(r'<input[^>]*id="submit_enc"[^>]*value="([^"]*)"', html)
+            or re.findall(r'<input[^>]*value="([^"]*)"[^>]*id="submit_enc"', html)
+        )
         value_matches = None
         if require_value:
-            value_matches = re.findall(r'value="(.*?)"', html)
             if not matches:
                 logging.error(f"Failed to get token from {url}")
                 return "", ""
+            # Anchor on the algorithm input itself; attribute order varies.
+            algo_matches = (
+                re.findall(r'<input[^>]*id="algorithm"[^>]*value="([^"]*)"', html)
+                or re.findall(r'<input[^>]*value="([^"]*)"[^>]*id="algorithm"', html)
+            )
+            if algo_matches:
+                value_matches = algo_matches
+            else:
+                # Some schools' page exposes exactly one submit_enc field that
+                # doubles as the signing salt; anything else is too ambiguous
+                # to guess (the first value= on a page is usually unrelated).
+                all_values = re.findall(r'value="(.*?)"', html)
+                if all_values and all(value == matches[0] for value in all_values):
+                    value_matches = matches
             if not value_matches:
                 logging.error(f"Failed to get submit value from {url}")
                 return matches[0], ""
         return matches[0] if matches else "", value_matches[0] if value_matches else ""
 
     def get_login_status(self):
-        self.requests.headers = self.login_headers
-        self.requests.get(url=self.login_page, verify=False)
+        # Per-request headers only: assigning to self.requests.headers would
+        # leak the mobile login headers (and their Host) into every later
+        # office.chaoxing.com request on the shared session.
+        self.requests.get(url=self.login_page, headers=self.login_headers, verify=False)
 
     def login(self, username, password):
-        username = AES_Encrypt(username)
+        encrypted_username = AES_Encrypt(username)
         password = AES_Encrypt(password)
         parm = {
             "fid": -1,
-            "uname": username,
+            "uname": encrypted_username,
             "password": password,
             "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2Fcode%3Fid%3D4219%26seatNum%3D380",
-            "t": True,
+            "t": "true",
         }
-        jsons = self.requests.post(url=self.login_url, params=parm, verify=False)
-        obj = jsons.json()
-        if obj["status"]:
+        jsons = self.requests.post(url=self.login_url, params=parm, headers=self.login_headers, verify=False)
+        try:
+            obj = jsons.json()
+        except ValueError:
+            logging.error(f"User {username} login failed: response is not JSON")
+            return (False, "登录响应不是 JSON")
+        if obj.get("status"):
             logging.info(f"User {username} login successfully")
             return (True, "")
         else:
             logging.info(
                 f"User {username} login failed. Please check you password and username! "
             )
-            return (False, obj["msg2"])
+            return (False, obj.get("msg2") or obj.get("msg") or "登录失败")
 
     # extra: get roomid
     def roomid(self, encode):
@@ -155,7 +165,9 @@ class reserve:
         try:
             validate_val = json.loads(data["extraData"])["validate"]
             return validate_val
-        except KeyError as e:
+        except (KeyError, TypeError, ValueError):
+            # KeyError: no validate field; TypeError: extraData is None;
+            # ValueError: non-JSON payload (risk-control page etc.).
             logging.info("Can't load validate value. Maybe server return mistake.")
             return ""
 
@@ -196,7 +208,11 @@ class reserve:
             slider_array = np.frombuffer(slide, np.uint8)
             slider_image = cv2.imdecode(slider_array, cv2.IMREAD_UNCHANGED)
             slider_part = slider_image[:, :, :3]
-            mask = slider_image[:, :, 3]
+            # Alpha channel is optional: PNG cutouts carry it, JPEG does not.
+            if slider_image.ndim == 3 and slider_image.shape[2] == 4:
+                mask = slider_image[:, :, 3]
+            else:
+                mask = np.full(slider_image.shape[:2], 255, np.uint8)
             mask[mask != 0] = 255
             x, y, w, h = cv2.boundingRect(mask)
             cropped_image = slider_part[y : y + h, x : x + w]
@@ -229,12 +245,21 @@ class reserve:
         res = cv2.matchTemplate(bg_pic, tp_pic, cv2.TM_CCOEFF_NORMED)
         _, _, _, max_loc = cv2.minMaxLoc(res)
         tl = max_loc
+        # NOTE: tl[0] is in source-image pixels. If the front end renders the
+        # captcha scaled, the submitted x must be multiplied by that ratio —
+        # verify once against a real page before relying on slider solving.
         return tl[0]
 
     def submit(self, times, roomid, seatid, action):
+        if not seatid:
+            logging.error("submit called with an empty seat list")
+            return False
+        suc = False
         for seat in seatid:
-            suc = False
-            while ~suc and self.max_attempt > 0:
+            # Per-seat attempt budget: the old shared self.max_attempt let the
+            # first seat starve every later candidate to zero tries.
+            attempts = self.max_attempt
+            while not suc and attempts > 0:
                 token, value = self._get_page_token(
                     self.url.format(roomid, seat), require_value=True
                 )
@@ -254,7 +279,7 @@ class reserve:
                 if suc:
                     return suc
                 time.sleep(self.sleep_time)
-                self.max_attempt -= 1
+                attempts -= 1
         return suc
 
     def get_submit(
@@ -280,13 +305,18 @@ class reserve:
             "verifyData": "1",
         }
         logging.info(f"submit parameter {parm} ")
-        # parm["enc"] = enc(parm)
         parm["enc"] = verify_param(parm, value)
         html = self.requests.post(url=url, params=parm, verify=True).content.decode(
             "utf-8"
         )
-        self.submit_msg.append(
-            times[0] + "~" + times[1] + ":  " + str(json.loads(html))
-        )
-        logging.info(json.loads(html))
-        return json.loads(html)["success"]
+        try:
+            payload = json.loads(html)
+            ok = bool(payload.get("success"))
+            message = payload.get("msg") or payload.get("message") or ""
+        except ValueError:
+            # A non-JSON body (login-expiry redirect, risk-control page) must
+            # fail this attempt instead of crashing the whole run.
+            ok, message = False, "响应不是 JSON（可能登录失效或被风控）"
+        self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(message or html[:200]))
+        logging.info(f"submit result: ok={ok} {message or html[:200]}")
+        return ok

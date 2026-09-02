@@ -20,12 +20,12 @@
 </head>
 <body>
   <h1>超星图书馆本地预约</h1>
-  <p class="muted">仅监听 localhost。不同账号可受控并行；同账号会串行。候选座位按顺序轮流尝试，整个计划最多 3 次，两次之间至少间隔 2 秒。</p>
+  <p class="muted">仅监听 localhost。不同账号可受控并行；同账号会串行。候选座位按顺序轮流尝试，每个候选座位只尝试一次（最多 6 个候选），两次提交之间有短暂随机间隔。</p>
   <p id="health-warning" class="muted" hidden></p>
   <div id="notice" class="notice" role="alert"></div>
   <div id="duplicate-confirm" class="duplicate-confirm" hidden role="alertdialog" aria-labelledby="duplicate-confirm-title"><strong id="duplicate-confirm-title">可能存在重复预约</strong><p id="duplicate-confirm-message"></p><div class="actions"><button type="button" id="cancel-duplicate">返回检查</button><button type="button" id="confirm-duplicate">确认仍然执行一次</button></div></div>
   <section><h2>账号</h2><form id="account-form"><input name="name" placeholder="名称" required><input name="username" placeholder="超星账号" required><input name="password" type="password" placeholder="密码" required><button>保存账号</button></form><div id="accounts"></div></section>
-  <section><h2>结果通知</h2><p class="muted">定时抢座的结果（成功/失败/需确认）会推送到手机；手动与探测任务不推送。</p>
+  <section><h2>结果通知</h2><p class="muted">预约任务的结果（成功/失败/需确认）会推送到手机；探测与自动发现任务不推送。</p>
     <div class="seat-entry"><select id="notify-type"><option value="none">不启用</option><option value="serverchan">Server酱（微信）</option><option value="bark">Bark（iOS）</option><option value="wecom_webhook">企业微信机器人</option></select><input id="notify-key" placeholder="SendKey / Bark Key / 机器人 Webhook 地址" style="flex:1"><button type="button" id="save-notify">保存</button><button type="button" id="test-notify">发送测试</button></div>
     <p id="notify-feedback" class="seat-feedback" role="status"></p>
   </section>
@@ -40,7 +40,7 @@
           <label class="visually-hidden" for="seat-entry">输入座位号</label><input id="seat-entry" name="seat_entry" inputmode="numeric" autocomplete="off" placeholder="输入座位号，例如 97" aria-describedby="seat-help seat-feedback">
           <button type="button" id="add-seat">添加</button><button type="button" id="toggle-bulk-seats">批量添加</button>
         </div>
-        <small id="seat-help" class="seat-help">输入后按回车或点击“添加”。系统会把 97 自动保存为 097；最多添加 3 个，以确保每个候选座位都能至少尝试一次。</small>
+        <small id="seat-help" class="seat-help">输入后按回车或点击“添加”。系统会把 97 自动保存为 097；最多添加 6 个（受“总尝试次数”限制），以确保每个候选座位都能至少尝试一次。</small>
         <div id="bulk-seats" class="bulk-seats" hidden>
           <label for="bulk-seat-entry">可粘贴多个座位号（支持逗号、空格和换行）</label><textarea id="bulk-seat-entry" placeholder="097，098\n099 100"></textarea>
           <div class="bulk-actions"><button type="button" id="confirm-bulk-seats">加入列表</button><button type="button" id="cancel-bulk-seats">取消</button></div>
@@ -60,6 +60,7 @@
     let csrf={{ csrf|tojson }}; const form=document.querySelector('#plan-form'), notice=document.querySelector('#notice'), duplicateConfirm=document.querySelector('#duplicate-confirm'), duplicateConfirmMessage=document.querySelector('#duplicate-confirm-message');
     const seatEntry=document.querySelector('#seat-entry'), seatList=document.querySelector('#seat-list'), seatEmpty=document.querySelector('#seat-empty'), seatFeedback=document.querySelector('#seat-feedback'), bulkSeats=document.querySelector('#bulk-seats'), bulkSeatEntry=document.querySelector('#bulk-seat-entry');
     let editingId=null, candidateSeats=[], draggingSeatIndex=null, pendingDuplicateRunId=null, selectParams=null, selectContextPath=null, selectContextSource=null;
+    function seatLimit(){const value=Number(form.elements.max_attempts.value);return Number.isFinite(value)&&value>=1?Math.min(Math.floor(value),6):3}
     const days=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
     function escapeHtml(value){const el=document.createElement('span');el.textContent=String(value??'');return el.innerHTML} function showNotice(message,type='error'){notice.textContent=message;notice.className=`notice ${type}`} function clearNotice(){notice.className='notice';notice.textContent=''} function hideDuplicateConfirm(){pendingDuplicateRunId=null;duplicateConfirm.hidden=true;duplicateConfirmMessage.textContent=''} function showDuplicateConfirm(run){pendingDuplicateRunId=run.id;duplicateConfirmMessage.textContent=`${run.message}。确认后只会额外执行这一次，并留下运行记录。`;duplicateConfirm.hidden=false;document.querySelector('#confirm-duplicate').focus()}
     async function api(url,options={},retried=false){const response=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,...(options.headers||{})}});let data;try{data=await response.json()}catch{data={}}if(response.status===403&&!retried){const token=await fetch('/api/csrf').then(r=>r.json());csrf=token.token;return api(url,options,true)}if(!response.ok){const detail=Array.isArray(data.detail)?data.detail.map(item=>item.msg).join('；'):(data.detail||'请求失败');throw new Error(detail)}return data}
@@ -76,7 +77,7 @@
     function normalizeSeat(value){const raw=String(value??'').trim();if(!raw)return {error:'请先输入座位号。'};if(!/^\d+$/.test(raw))return {error:'座位号只能包含数字。'};if(raw.length>16)return {error:'座位号不能超过 16 位。'};return {value:raw.padStart(3,'0')}}
     function setSeatFeedback(message='',type=''){seatFeedback.textContent=message;seatFeedback.className=`seat-feedback ${type}`.trim();seatEntry.setAttribute('aria-invalid',String(type==='error'))}
     function renderSeats(){seatList.innerHTML=candidateSeats.map((seat,index)=>`<div class="seat-item" role="listitem" draggable="true" data-seat-index="${index}"><span class="seat-rank">${index+1}</span><span class="seat-number">${escapeHtml(seat)}</span><span class="seat-actions"><button type="button" data-seat-action="up" data-seat-index="${index}" aria-label="将座位 ${escapeHtml(seat)} 上移" ${index===0?'disabled':''}>上移</button><button type="button" data-seat-action="down" data-seat-index="${index}" aria-label="将座位 ${escapeHtml(seat)} 下移" ${index===candidateSeats.length-1?'disabled':''}>下移</button><button type="button" data-seat-action="remove" data-seat-index="${index}" aria-label="删除座位 ${escapeHtml(seat)}">删除</button></span></div>`).join('');seatEmpty.hidden=candidateSeats.length>0}
-    function addSeatValues(values){const added=[],skipped=[];for(const source of values){const result=normalizeSeat(source);if(result.error){if(String(source).trim())skipped.push(`${String(source).trim()}（${result.error}）`);continue}if(candidateSeats.includes(result.value)){skipped.push(`${result.value}（已在列表中）`);continue}if(candidateSeats.length>=3){skipped.push(`${result.value}（最多添加 3 个）`);break}candidateSeats.push(result.value);added.push(result.value)}renderSeats();const messages=[];if(added.length)messages.push(`已添加 ${added.length} 个座位：${added.join('、')}。`);if(skipped.length)messages.push(`未添加：${skipped.join('；')}。`);setSeatFeedback(messages.join(' '),skipped.length?'error':'success');return added.length>0}
+    function addSeatValues(values){const added=[],skipped=[];for(const source of values){const result=normalizeSeat(source);if(result.error){if(String(source).trim())skipped.push(`${String(source).trim()}（${result.error}）`);continue}if(candidateSeats.includes(result.value)){skipped.push(`${result.value}（已在列表中）`);continue}if(candidateSeats.length>=seatLimit()){skipped.push(`${result.value}（最多添加 ${seatLimit()} 个，请先调大总尝试次数）`);break}candidateSeats.push(result.value);added.push(result.value)}renderSeats();const messages=[];if(added.length)messages.push(`已添加 ${added.length} 个座位：${added.join('、')}。`);if(skipped.length)messages.push(`未添加：${skipped.join('；')}。`);setSeatFeedback(messages.join(' '),skipped.length?'error':'success');return added.length>0}
     function addSingleSeat(){const raw=seatEntry.value;const added=addSeatValues([raw]);if(added){seatEntry.value='';seatEntry.focus()}}
     function moveSeat(from,to){if(to<0||to>=candidateSeats.length||from===to)return;const [seat]=candidateSeats.splice(from,1);candidateSeats.splice(to,0,seat);renderSeats();setSeatFeedback(`已将座位 ${seat} 调整为第 ${to+1} 优先。`,'success')}
     function closeBulkSeats(){bulkSeats.hidden=true;bulkSeatEntry.value=''}

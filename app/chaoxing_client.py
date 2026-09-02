@@ -124,15 +124,13 @@ def _input_fields(text: str) -> tuple[str, str]:
         if field_id == "algorithm" or field_name == "algorithm":
             algorithm = value
     if not algorithm:
-        # Older pages either expose a second unnamed signing value or only the
-        # canonical ``submit_enc`` field.  The upstream ChaoXing client uses
-        # that lone field both as the request token and as the signature salt;
-        # a live read-only probe of this school's target-day page has exactly
-        # that one-field shape.  Do not apply this fallback to arbitrary form
-        # inputs: it is limited to a page whose only non-empty input value is
-        # the explicitly identified submit_enc token.
-        algorithm = next((value for value in values if value and value != token), "")
-        if not algorithm and token and values and all(value == token for value in values):
+        # Mirror the legacy client (utils/reserve.py, pinned by
+        # tests/legacy_smoke.py): ``submit_enc`` may double as the signing
+        # salt only when it is the page's sole non-empty input value.  A page
+        # carrying any other value is too ambiguous to guess — a wrong salt
+        # computes a wrong ``enc`` and the submit is rejected (or worse,
+        # risk-flagged), so report the algorithm as missing instead.
+        if token and values and all(value == token for value in values):
             algorithm = token
     return token, algorithm
 
@@ -301,7 +299,7 @@ class ChaoxingClient:
             "uname": AES_Encrypt(self.username),
             "password": AES_Encrypt(self.password),
             "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2Fcode%3Fid%3D4219%26seatNum%3D380",
-            "t": True,
+            "t": "true",
         }
         try:
             payload = self._request("POST", self.login_url, params=params, headers=LOGIN_HEADERS).json()
@@ -425,7 +423,7 @@ class ChaoxingClient:
             text = html.unescape(response.text)
         text = text.replace("\\/", "/")
         candidates = [str(getattr(response, "url", ""))]
-        candidates.extend(re.findall(r"(?:https?:)?//[^\"'<>\\s]+/front/(?:third/)?apps/seat/select[^\"'<>\\s]*", text, re.I))
+        candidates.extend(re.findall(r"(?:https?:)?//[^\"'<>\s]+/front/(?:third/)?apps/seat/select[^\"'<>\s]*", text, re.I))
         candidates.extend(re.findall(r"(?:href|location)\s*[=:]\s*[\"']([^\"']*?/front/(?:third/)?apps/seat/select[^\"']*)", text, re.I))
         for candidate in candidates:
             absolute = urljoin("https://office.chaoxing.com/", candidate)
@@ -575,14 +573,14 @@ class ChaoxingClient:
         return items
 
     @staticmethod
-    def find_reservation(
+    def find_overlapping_reservations(
         reservations: list[dict],
         target_day: dt.date,
         room_id: str,
         start_time: str,
         end_time: str,
-    ) -> dict | None:
-        """Return the server-side reservation that overlaps this request, if any.
+    ) -> list[dict]:
+        """Return every server-side reservation that overlaps this request.
 
         Epoch-millisecond times are converted in Asia/Shanghai; the item's own
         ``today`` field must equal the target day so midnight-adjacent records
@@ -601,8 +599,9 @@ class ChaoxingClient:
             wanted_start = int(start_time[:2]) * 60 + int(start_time[3:5])
             wanted_end = int(end_time[:2]) * 60 + int(end_time[3:5])
         except (TypeError, ValueError):
-            return None
+            return []
         room = str(room_id).strip()
+        matches: list[dict] = []
         for item in reservations:
             if not isinstance(item, dict):
                 continue
@@ -615,8 +614,20 @@ class ChaoxingClient:
             if item_start is None or item_end is None:
                 continue
             if item_start < wanted_end and item_end > wanted_start:
-                return item
-        return None
+                matches.append(item)
+        return matches
+
+    @staticmethod
+    def find_reservation(
+        reservations: list[dict],
+        target_day: dt.date,
+        room_id: str,
+        start_time: str,
+        end_time: str,
+    ) -> dict | None:
+        """Return the first server-side reservation that overlaps this request, if any."""
+        items = ChaoxingClient.find_overlapping_reservations(reservations, target_day, room_id, start_time, end_time)
+        return items[0] if items else None
 
     def _solve_slider(self) -> str:
         try:
@@ -693,6 +704,9 @@ class ChaoxingClient:
         # Generate enc and submit immediately so the token cannot go stale.
         params["enc"] = verify_param(params, probe.algorithm)
         headers = {**OFFICE_HEADERS, "Referer": self.select_page_url if probe.source == "target_day" else self.page_url.format(room=room_id, seat=normalize_seat(seat_num))}
+        # A deadline that already passed aborts before any byte hits the wire;
+        # such an attempt must not be audited as a possible submission.
+        self._remaining_seconds()
         # From this point the request may have reached the platform even if the
         # response times out or cannot be decoded. Callers must not retry it.
         self.last_submitted = True
