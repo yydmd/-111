@@ -237,13 +237,118 @@ def scenario_parallel_token_stale_recovery() -> None:
     db = factory()
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     check("stale-volley-recovers", run.status == "SUCCESS", f"status={run.status}")
-    # 4 parallel POSTs + exactly one serial refresh-retry; the confirmed-taken
-    # seat is never retried.
-    check("stale-volley-submit-count", len(submits) == 5, f"submits={submits}")
+    # 3 个 303 座位各 1+2 次自愈 = 9 发 + 占用座位 1 发 + 恰好 1 次串行刷新重试；
+    # the confirmed-taken seat is never healed nor retried.
+    check("stale-volley-submit-count", len(submits) == 11, f"submits={submits}")
     check("stale-dead-seat-not-retried", submits.count("100") == 1, f"submits={submits}")
     check("stale-winner-is-live-seat", run.selected_seat in {"097", "098", "099"}, f"seat={run.selected_seat}")
-    check("stale-audit-complete", len(run.attempt_details) == 5, f"details={len(run.attempt_details)}")
+    check("stale-audit-complete", len(run.attempt_details) == 11, f"details={len(run.attempt_details)}")
     db.close()
+
+
+def scenario_volley_heal_in_place() -> None:
+    """Race hardening 2026-09-03: a 303-rejected racer heals itself with one
+    fresh page fetch + resubmit instead of falling back to the serial path."""
+    factory = make_factory(DATA, "uc-heal")
+    plan_id = make_plan(factory, seats=("097", "098"), max_attempts=3)
+    submits: list[str] = []
+    tries: dict[str, int] = {}
+    real_server_now = service.app_clock.server_now
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "target_day"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+        def login(self): pass
+        def browse(self, *args, **kwargs): pass
+        def clone_authenticated(self):
+            clone = Client()
+            clone.is_clone = True
+            return clone
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+        def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
+            self.last_submitted = True
+            submits.append(seat)
+            tries[seat] = tries.get(seat, 0) + 1
+            if self.is_clone and tries[seat] == 1:
+                raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+            return "预约成功"
+
+    service.SessionLocal = factory
+    service.ChaoxingClient = Client
+    service.notify_async = lambda *args, **kwargs: None
+    service.app_clock.server_now = lambda: time.time()
+    service._scheduled_fire_epoch = lambda _plan: time.time()
+    service._poll_until_open = lambda *a, **k: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day")
+    service.execute_plan(plan_id, trigger="scheduled")
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    check("heal-in-place-wins", (run.status, run.selected_seat) == ("SUCCESS", "097"), f"{run.status}/{run.selected_seat}")
+    check("heal-in-place-submits", submits.count("097") == 2, f"submits={submits}")
+    healed = next(a for a in run.attempt_details if a["seat"] == "097" and a["code"] is None)
+    check("heal-telemetry-recorded", {"page_ms", "submit_ms", "token_age_ms", "heals"} <= set(healed.get("timing", {})),
+          f"timing={healed.get('timing')}")
+    db.close()
+
+
+def scenario_late_submit_unknown() -> None:
+    """Race hardening 2026-09-03: a POST still on the wire past the deadline
+    must be audited as SUBMIT_OUTCOME_UNKNOWN (server-verified by the caller)
+    and never silently dropped."""
+    import threading
+
+    real_grace = service.LATE_SUBMIT_GRACE_SECONDS
+    real_server_now = service.app_clock.server_now
+    real_poller = service._poll_until_open
+    released = threading.Event()
+
+    class Client:
+        deadline = None
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "target_day"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+        def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
+            self.last_submitted = True
+            if self.is_clone:
+                if not released.wait(3):
+                    raise service.ReservationError("NETWORK_ERROR", "读超时")
+                return "预约成功"
+            raise AssertionError("主会话在此场景不应提交")
+        def clone_authenticated(self):
+            clone = Client()
+            clone.is_clone = True
+            return clone
+
+    client = Client()
+    try:
+        service.LATE_SUBMIT_GRACE_SECONDS = 0.2
+        service.app_clock.server_now = lambda: time.time()
+        service._poll_until_open = lambda *a, **k: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day")
+        outcomes, winner = service._parallel_opening_shot(
+            client,
+            {"room_id": "100", "start_time": "08:00", "end_time": "09:00",
+             "select_params": None, "select_context_path": None, "select_context_source": None},
+            __import__("datetime").date(2026, 9, 4), ["097"], time.time(), time.monotonic() + 0.3,
+        )
+        check("late-submit-audited",
+              winner is None and [(o["seat"], o["code"]) for o in outcomes] == [("097", "SUBMIT_OUTCOME_UNKNOWN")],
+              f"outcomes={[(o['seat'], o['code']) for o in outcomes]}")
+        check("late-submit-client-extended", client.deadline is not None and client.deadline > time.monotonic(),
+              f"deadline={client.deadline}")
+    finally:
+        released.set()
+        service.LATE_SUBMIT_GRACE_SECONDS = real_grace
+        service.app_clock.server_now = real_server_now
+        service._poll_until_open = real_poller
 
 
 def scenario_stale_exhaustion_keeps_real_code() -> None:
@@ -519,6 +624,8 @@ def main() -> int:
     scenario_patch_toggle_preserves_context()
     scenario_redirect_and_rate_limit_retryable()
     scenario_constants()
+    scenario_volley_heal_in_place()
+    scenario_late_submit_unknown()
     for line in CHECKS:
         print(line)
     failures = [line for line in CHECKS if line.startswith("FAIL")]

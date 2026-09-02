@@ -1526,8 +1526,8 @@ def test_volley_token_stale_falls_back_to_serial_refresh(tmp_path, monkeypatch):
             return "预约成功"
 
     status, error_code = _run_volley_plan(tmp_path, monkeypatch, FakeClient, seats=("001", "002"), max_attempts=6)
-    # 两个并行 racer 各被拒一次（303），串行兜底刷新重试后成功。
-    assert len(submits) == 3
+    # 每个 racer 被 303 拒后原地自愈重试 2 次（共 3 发/座，仍 303），串行兜底刷新后成功。
+    assert len(submits) == 7
     assert (status, error_code) == ("SUCCESS", None)
 
 
@@ -1583,9 +1583,10 @@ def test_full_stale_volley_still_gets_refresh_retry(tmp_path, monkeypatch):
     submits: list[str] = []
     fake = _full_stale_volley_client(submits, stale_seats={"097", "098", "099"}, main_submit=lambda seat: "预约成功")
     status, error_code = _run_volley_plan(tmp_path, monkeypatch, fake, seats=("097", "098", "099", "100"), max_attempts=3)
-    # 4 次并行提交 + 至少 1 次串行刷新重试（对仍存活的座位）。
-    assert len(submits) == 5
+    # 3 个 303 座位各打 1+2 次自愈 = 9 发、占用座位 1 发（既不自愈也不重试），串行刷新重试成功。
+    assert len(submits) == 11
     assert submits.count("100") == 1  # 确认占用的座位不再重试
+    assert submits.count("097") == 4  # 3 发自愈 + 1 发串行刷新成功
     assert (status, error_code) == ("SUCCESS", None)
 
 
@@ -1968,3 +1969,230 @@ def test_next_run_at_reads_live_scheduler():
         except Exception:
             pass
         web.scheduler.shutdown(wait=False)
+
+
+def test_volley_racer_heals_token_stale_in_place(tmp_path, monkeypatch):
+    """竞速硬化回归：被 303 拒绝的 racer 原地刷新重提，不退到秒级串行路径。
+
+    遥测（page_ms/submit_ms/token_age_ms/heals）必须落进审计记录，
+    用真实数据持续定位 303 根因。
+    """
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("097", "098"), max_attempts=3)
+    submits: list[str] = []
+    parent_submits: list[str] = []
+    tries: dict[str, int] = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "target_day"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self): pass
+
+        def browse(self, *args, **kwargs): pass
+
+        def clone_authenticated(self):
+            clone = FakeClient()
+            clone.is_clone = True
+            return clone
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            self.last_submitted = True
+            if not self.is_clone:
+                parent_submits.append(seat)
+                raise AssertionError("racer 应在 volley 内自愈，串行路径不应执行")
+            submits.append(seat)
+            tries[seat] = tries.get(seat, 0) + 1
+            if tries[seat] == 1:
+                raise ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+            return "预约成功"
+
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
+    monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "notify_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service.app_clock, "server_now", lambda: time.time())
+    monkeypatch.setattr(service, "_scheduled_fire_epoch", lambda _plan: time.time())
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    # _hold_until_fire 不打桩：真实的 50ms 错峰保证 097 先自愈成功、098 未及出手。
+    service.execute_plan(plan_id, trigger="scheduled")
+    # 优先级最高的 097 第一次被 303 拒、自愈重提成功；098 未及出手即停。
+    assert submits.count("097") == 2
+    assert parent_submits == []
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    assert (run.status, run.selected_seat) == ("SUCCESS", "097")
+    codes = [(a["seat"], a["code"]) for a in run.attempt_details if a["seat"] == "097"]
+    assert ("097", "TOKEN_STALE") in codes and ("097", None) in codes
+    healed = next(a for a in run.attempt_details if a["seat"] == "097" and a["code"] is None)
+    assert {"page_ms", "submit_ms", "token_age_ms"} <= set(healed.get("timing", {}))
+    assert healed["timing"].get("heals") == 1
+    db.close()
+
+
+def test_volley_heal_attempts_are_bounded(tmp_path, monkeypatch):
+    """自愈有上限：持续 303 的座位打满 1+RACER_HEAL_ATTEMPTS 发后交回串行轮换。"""
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("097", "098"), max_attempts=3)
+    clone_submits: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "target_day"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self): pass
+
+        def browse(self, *args, **kwargs): pass
+
+        def clone_authenticated(self):
+            clone = FakeClient()
+            clone.is_clone = True
+            return clone
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            self.last_submitted = True
+            if self.is_clone:
+                clone_submits.append(seat)
+                raise ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+            return "预约成功"
+
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
+    monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "notify_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_scheduled_fire_epoch", lambda _plan: time.time())
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    monkeypatch.setattr(service, "_hold_until_fire", lambda *_args, **_kwargs: None)
+    service.execute_plan(plan_id, trigger="scheduled")
+    assert clone_submits.count("097") == 1 + service.RACER_HEAL_ATTEMPTS
+    assert clone_submits.count("098") == 1 + service.RACER_HEAL_ATTEMPTS
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    assert run.status == "SUCCESS"  # 自愈耗尽后串行兜底收尾
+    db.close()
+
+
+def test_late_racer_submit_is_audited_and_verifiable(monkeypatch):
+    """竞速硬化回归：deadline 后仍在途的提交必须进审计并触发核实，不得静默失败。"""
+    import app.service as service
+
+    monkeypatch.setattr(service, "LATE_SUBMIT_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(service.app_clock, "server_now", lambda: time.time())
+    released = threading.Event()
+
+    class FakeClient:
+        deadline = None
+
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "target_day"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            self.last_submitted = True
+            if self.is_clone:
+                if not released.wait(3):
+                    raise ReservationError("NETWORK_ERROR", "读超时")
+                return "预约成功"
+            raise AssertionError("主会话在此场景不应提交")
+
+        def clone_authenticated(self):
+            clone = FakeClient()
+            clone.is_clone = True
+            return clone
+
+    client = FakeClient()
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    request_values = {"room_id": "100", "start_time": "08:00", "end_time": "09:00",
+                      "select_params": None, "select_context_path": None, "select_context_source": None}
+    try:
+        outcomes, winner = service._parallel_opening_shot(
+            client, request_values, date(2026, 9, 4), ["097"], time.time(), time.monotonic() + 0.3,
+        )
+        assert winner is None
+        assert [(o["seat"], o["code"], o["submitted"]) for o in outcomes] == [("097", "SUBMIT_OUTCOME_UNKNOWN", True)]
+        # 核实需要活的会话：客户端 deadline 必须被临时延长。
+        assert client.deadline is not None and client.deadline > time.monotonic()
+    finally:
+        released.set()
+
+
+def test_volley_stagger_preserves_priority_order(monkeypatch):
+    """竞速硬化回归：racer 按优先级序错峰开火（097 最先，总跨度 ≥ 3×50ms）。"""
+    import app.service as service
+
+    first_submit_at: dict[str, float] = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.last_parameter_source = "target_day"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            self.last_submitted = True
+            first_submit_at.setdefault(seat, time.monotonic())
+            raise ReservationError("SEAT_UNAVAILABLE", "该时间段已被占用！")
+
+        def clone_authenticated(self):
+            return FakeClient()
+
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    monkeypatch.setattr(service.app_clock, "server_now", lambda: time.time())
+    request_values = {"room_id": "100", "start_time": "08:00", "end_time": "09:00",
+                      "select_params": None, "select_context_path": None, "select_context_source": None}
+    outcomes, winner = service._parallel_opening_shot(
+        FakeClient(), request_values, date(2026, 9, 4), ["097", "098", "099", "100"], time.time(), time.monotonic() + 10,
+    )
+    assert winner is None
+    assert {o["seat"] for o in outcomes} == {"097", "098", "099", "100"}
+    timestamps = [first_submit_at[seat] for seat in ("097", "098", "099", "100")]
+    assert timestamps == sorted(timestamps)  # 优先级高的先发
+    assert (timestamps[-1] - timestamps[0]) >= 3 * service.RACER_STAGGER_SECONDS - 0.03

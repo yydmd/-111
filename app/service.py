@@ -63,6 +63,21 @@ RETRY_WAIT_RANGE = (0.3, 0.6)
 # fetch before it is submitted: a page that aged through failed re-fetches is
 # exactly what the platform rejects with error 303 (TOKEN_STALE).
 STALE_PAGE_TOLERANCE_SECONDS = 1.0
+# 2026-09-03 race hardening. A 303-rejected racer heals itself with a fresh
+# page fetch + resubmit (the platform's own 303 remedy) instead of falling
+# back to the seconds-slower serial path; heals are capped so a persistently
+# stale seat still hands over to the serial rotation quickly.
+RACER_HEAL_ATTEMPTS = 2
+# Racers fire staggered by priority order — the same account bursting N
+# identical POSTs within one millisecond is the anti-burst pattern both
+# 2026-09-03 volleys were wholly rejected with (3×303 + 1 occupied).
+RACER_STAGGER_SECONDS = 0.05
+# Per-request timeouts are floored at 1s, so a racer's POST may still be on
+# the wire when the run deadline hits; a bounded grace lets it land and be
+# audited (or server-verified) instead of silently dropped.
+LATE_SUBMIT_GRACE_SECONDS = 2.5
+# Server verification after the deadline needs a live session.
+VERIFY_BUDGET_SECONDS = 8.0
 # How many candidate seats submit simultaneously at the opening moment. The
 # web UI caps a plan's candidate pool at the same number, so a full pool can
 # be covered by one all-at-once volley.
@@ -169,18 +184,24 @@ def _set_failure(run: ReservationRun, code: str, message: str, *, status: str = 
     run.message = redact(message)
 
 
-def _append_attempt(run: ReservationRun, *, seat: str, source: str, submitted: bool, code: str | None, message: str) -> None:
-    """Persist a small, secret-free account of what actually happened."""
+def _append_attempt(run: ReservationRun, *, seat: str, source: str, submitted: bool, code: str | None, message: str, timing: dict | None = None) -> None:
+    """Persist a small, secret-free account of what actually happened.
+
+    ``timing`` carries race telemetry (page/submit/token-age milliseconds,
+    heal counts) so real-world volley behaviour can be analysed from the run
+    record instead of guesswork.
+    """
     details = run.attempt_details
-    details.append(
-        {
-            "seat": seat,
-            "source": source or "unknown",
-            "submitted": bool(submitted),
-            "code": code,
-            "message": redact(message),
-        }
-    )
+    entry = {
+        "seat": seat,
+        "source": source or "unknown",
+        "submitted": bool(submitted),
+        "code": code,
+        "message": redact(message),
+    }
+    if timing:
+        entry["timing"] = {key: (round(value, 1) if isinstance(value, float) else value) for key, value in timing.items()}
+    details.append(entry)
     run.attempt_details_json = json.dumps(details, ensure_ascii=False)
 
 
@@ -489,8 +510,11 @@ def _parallel_opening_shot(
     winner: dict | None = None
     guard = threading.Lock()
     stop = threading.Event()
+    # Seats whose POST is on the wire right now (guarded by ``guard``); the
+    # post-deadline grace uses this to audit/verify stragglers.
+    submitting: set[str] = set()
 
-    def race(seat: str, racer: ChaoxingClient) -> None:
+    def race(seat: str, racer: ChaoxingClient, index: int) -> None:
         nonlocal winner
         # 1) Arrive at the lead window, then warm DNS/TCP/TLS with one cheap
         #    GET on the exact decisive URL — late enough that the pooled
@@ -515,61 +539,92 @@ def _parallel_opening_shot(
         # poller wakes us ~PREFETCH_LEAD_SECONDS early, and a token fetched
         # that far before the submit is exactly what ChaoXing rejects with
         # error 303 (页面停留过久/安全验证已超时).
-        _hold_until_fire(fire_epoch)
+        # Racers then stagger by priority order: the same account firing N
+        # identical POSTs within one millisecond is the anti-burst pattern
+        # both 2026-09-03 volleys were wholly rejected with.
+        _hold_until_fire(fire_epoch + index * RACER_STAGGER_SECONDS)
         if stop.is_set():
             return
-        # 2) Shortest path: one GET on the poller-verified context. Only an
-        #    unusable answer falls back to the full resolver chain.
-        resolved = None
-        try:
-            fast = racer.fetch_target_day_page(target_day, dict(verified_context), select_path)
-            if fast is not None and (fast.ok or fast.captcha_type in CAPTCHA_TYPES):
-                resolved = fast
-        except Exception:
-            resolved = None  # any surprise falls back to the full resolver
-        if resolved is None:
+        heals_left = RACER_HEAL_ATTEMPTS
+        while True:
+            # 2) Shortest path: one GET on the poller-verified context. Only an
+            #    unusable answer falls back to the full resolver chain.
+            resolve_started = time.monotonic()
+            resolved = None
             try:
-                resolved = racer.resolve_submission_page(
-                    room_id, seat, target_day,
-                    select_params=select_params, select_path=select_path, select_source=select_source,
-                )
-            except ReservationError:
-                resolved = None
-        if resolved is None:
-            # Last resort: the poller's page may still carry a usable token.
-            page = pre_holder.get("page")
-            if page is None or not page.ok or page.captcha_type in CAPTCHA_TYPES:
+                fast = racer.fetch_target_day_page(target_day, dict(verified_context), select_path)
+                if fast is not None and (fast.ok or fast.captcha_type in CAPTCHA_TYPES):
+                    resolved = fast
+            except Exception:
+                resolved = None  # any surprise falls back to the full resolver
+            if resolved is None:
+                try:
+                    resolved = racer.resolve_submission_page(
+                        room_id, seat, target_day,
+                        select_params=select_params, select_path=select_path, select_source=select_source,
+                    )
+                except ReservationError:
+                    resolved = None
+            if resolved is None:
+                # Last resort: the poller's page may still carry a usable token.
+                page = pre_holder.get("page")
+                if page is None or not page.ok or page.captcha_type in CAPTCHA_TYPES:
+                    return
+                resolved = page
+            if stop.is_set():
                 return
-            resolved = page
-        if stop.is_set():
-            return
-        try:
-            message = racer.submit_once(
-                room_id, seat, start_time, end_time, target_day,
-                select_params=select_params, select_path=select_path, select_source=select_source,
-                pre_resolved=resolved,
-            )
-        except ReservationError as exc:
+            resolved_at = time.monotonic()
+            timing = {"page_ms": round((resolved_at - resolve_started) * 1000, 1)}
+            heals_used = RACER_HEAL_ATTEMPTS - heals_left
+            if heals_used:
+                timing["heals"] = heals_used
+            submit_started = time.monotonic()
             with guard:
-                outcomes.append({
-                    "seat": seat, "code": exc.code, "message": exc.message,
-                    "submitted": bool(getattr(racer, "last_submitted", False)),
-                    "source": getattr(racer, "last_parameter_source", "") or "unknown",
-                })
+                submitting.add(seat)
+            try:
+                message = racer.submit_once(
+                    room_id, seat, start_time, end_time, target_day,
+                    select_params=select_params, select_path=select_path, select_source=select_source,
+                    pre_resolved=resolved,
+                )
+            except ReservationError as exc:
+                timing["submit_ms"] = round((time.monotonic() - submit_started) * 1000, 1)
+                timing["token_age_ms"] = round((submit_started - resolved_at) * 1000, 1)
+                with guard:
+                    submitting.discard(seat)
+                    outcomes.append({
+                        "seat": seat, "code": exc.code, "message": exc.message,
+                        "submitted": bool(getattr(racer, "last_submitted", False)),
+                        "source": getattr(racer, "last_parameter_source", "") or "unknown",
+                        "timing": timing,
+                    })
+                if exc.code == "TOKEN_STALE" and heals_left > 0 and not stop.is_set():
+                    # 303 self-heal: the platform definitively refused this
+                    # token and itself asked for a refresh + resubmit, so a
+                    # retry carries no double-submit risk. Healing here turns
+                    # a seconds-long serial recovery into ~one round trip.
+                    # Every other code keeps the one-shot-per-racer behaviour.
+                    heals_left -= 1
+                    continue
+                return
+            timing["submit_ms"] = round((time.monotonic() - submit_started) * 1000, 1)
+            timing["token_age_ms"] = round((submit_started - resolved_at) * 1000, 1)
+            with guard:
+                submitting.discard(seat)
+                outcomes.append({"seat": seat, "code": None, "message": message, "submitted": True,
+                                 "source": getattr(racer, "last_parameter_source", "") or "unknown",
+                                 "timing": timing})
+                if winner is None:
+                    winner = outcomes[-1]
+                    stop.set()
             return
-        with guard:
-            outcomes.append({"seat": seat, "code": None, "message": message, "submitted": True,
-                             "source": getattr(racer, "last_parameter_source", "") or "unknown"})
-            if winner is None:
-                winner = outcomes[-1]
-                stop.set()
 
     # Referenced by race() as a last-resort page; defined before the threads
     # start so no scheduling surprise can race the assignment.
     pre_holder: dict = {"page": None}
     threads = [
-        threading.Thread(target=race, args=(seat, client.clone_authenticated()), name=f"opening-{seat}")
-        for seat in workers
+        threading.Thread(target=race, args=(seat, client.clone_authenticated(), index), name=f"opening-{seat}")
+        for index, seat in enumerate(workers)
     ]
     for thread in threads:
         thread.start()
@@ -590,8 +645,44 @@ def _parallel_opening_shot(
         opened.set()
     if pre is None:
         return [], None
+    logger.info(
+        "opening window detected: server_epoch=%.3f fire=%.3f delta_ms=%.0f",
+        app_clock.server_now(), fire_epoch, (app_clock.server_now() - fire_epoch) * 1000,
+    )
     for thread in threads:
         thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    # A racer's POST may still be on the wire past the deadline (per-request
+    # timeouts are floored at 1s). A bounded grace lets it land and be audited
+    # instead of silently dropping a possibly-successful reservation.
+    grace_deadline = deadline + LATE_SUBMIT_GRACE_SECONDS
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(timeout=max(0.0, grace_deadline - time.monotonic()))
+    if outcomes:
+        logger.info(
+            "volley outcomes: %s",
+            "; ".join(f"{item['seat']}={item['code'] or 'SUCCESS'}" for item in outcomes),
+        )
+    with guard:
+        stuck = sorted(submitting)
+    if stuck:
+        # A POST left the wire but never came back within the grace: stop the
+        # stragglers, audit the seats as outcome-unknown, and (when nobody
+        # won) hand the decision to the caller's existing server-verification
+        # branch — found becomes SUCCESS, unverifiable becomes
+        # NEEDS_VERIFICATION. Never a silent failure again.
+        stop.set()
+        for seat in stuck:
+            outcomes.append({
+                "seat": seat, "code": "SUBMIT_OUTCOME_UNKNOWN",
+                "message": "提交已发出但未在运行时限内返回；等待超星端核实",
+                "submitted": True, "source": "unknown",
+            })
+        if winner is None:
+            # Verification needs live HTTP; the run deadline has passed. The
+            # serial fallback checks its own local deadline variable, so this
+            # extension cannot buy any extra submit.
+            client.deadline = time.monotonic() + VERIFY_BUDGET_SECONDS
     return outcomes, winner
 
 
@@ -882,6 +973,7 @@ def execute_plan(
                             submitted=outcome["submitted"],
                             code=outcome["code"],
                             message=outcome["message"],
+                            timing=outcome.get("timing"),
                         )
                         messages.append(f"开抢并行，座位 {outcome['seat']}：{outcome['code'] or 'SUCCESS'} {outcome['message']}")
                     if winner is not None:
