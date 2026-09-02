@@ -8,8 +8,18 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# NOTE: everything below until the ``__main__`` block is the legacy
+# command-line reserve script (python main.py -m reserve/debug/room), kept for
+# backwards compatibility. The local web service only uses ``-m serve`` and
+# deliberately does not import this legacy stack (numpy/opencv heavy) — see
+# _legacy_runtime().
 
-from utils import reserve, get_user_credentials
+
+def _legacy_runtime():
+    """Import the legacy reserve stack lazily, only for CLI modes."""
+    from utils import reserve, get_user_credentials
+
+    return reserve, get_user_credentials
 
 get_current_time = lambda action: (
     time.strftime("%H:%M:%S", time.localtime(time.time() + 8 * 3600))
@@ -54,6 +64,7 @@ def login_and_reserve(users, usernames, passwords, action, success_list=None):
             logging.info(
                 f"----------- {username} -- {times} -- {seatid} try -----------"
             )
+            reserve, _ = _legacy_runtime()
             s = reserve(
                 sleep_time=SLEEPTIME,
                 max_attempt=MAX_ATTEMPT,
@@ -74,6 +85,7 @@ def main(users, action=False):
     attempt_times = 0
     usernames, passwords = None, None
     if action:
+        _, get_user_credentials = _legacy_runtime()
         usernames, passwords = get_user_credentials(action)
     success_list = None
     current_dayofweek = get_current_dayofweek(action)
@@ -103,6 +115,7 @@ def debug(users, action=False):
     )
     suc = False
     logging.info(f" Debug Mode start! , action {'on' if action else 'off'}")
+    reserve, get_user_credentials = _legacy_runtime()
     if action:
         usernames, passwords = get_user_credentials(action)
     current_dayofweek = get_current_dayofweek(action)
@@ -136,6 +149,7 @@ def debug(users, action=False):
 def get_roomid(args1, args2):
     username = input("请输入用户名：")
     password = input("请输入密码：")
+    reserve, _ = _legacy_runtime()
     s = reserve(
         sleep_time=SLEEPTIME,
         max_attempt=MAX_ATTEMPT,
@@ -157,7 +171,7 @@ if __name__ == "__main__":
         "-m",
         "--method",
         default="reserve",
-        choices=["reserve", "debug", "room"],
+        choices=["reserve", "debug", "room", "serve"],
         help="for debug",
     )
     parser.add_argument(
@@ -168,6 +182,24 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     func_dict = {"reserve": main, "debug": debug, "room": get_roomid}
-    with open(args.user, "r+") as data:
-        usersdata = json.load(data)["reserve"]
-    func_dict[args.method](usersdata, args.action)
+    if args.method == "serve":
+        import uvicorn
+        from app.single_instance import acquire_service_mutex, release_service_mutex
+
+        if not acquire_service_mutex():
+            message = "本地预约服务已经在运行（互斥量被占用，本进程退出）：请打开 http://127.0.0.1:8787/"
+            print(message, flush=True)
+            logging.warning(message)
+            raise SystemExit(0)
+        try:
+            logging.info("service instance mutex acquired; starting uvicorn on 127.0.0.1:8787")
+            # The watchdog probes /health regularly. Suppress only Uvicorn's
+            # per-request access lines so that those probes do not grow the
+            # service log indefinitely; application warnings/errors remain.
+            uvicorn.run("app.web:app", host="127.0.0.1", port=8787, reload=False, access_log=False)
+        finally:
+            release_service_mutex()
+    else:
+        with open(args.user, "r", encoding="utf-8") as data:
+            usersdata = json.load(data)["reserve"]
+        func_dict[args.method](usersdata, args.action)

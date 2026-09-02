@@ -128,3 +128,8 @@ dmypy.json
 # Pyre type checker
 .pyre/
 test.json
+
+# Local application state and secrets
+data/
+.pytest_cache/
+.venv/
