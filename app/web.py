@@ -102,8 +102,9 @@ class PlanData(BaseModel):
     weekdays: list[str] = Field(default_factory=lambda: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"])
     slider_enabled: bool = False
     # Risk-control cap: existing plans storing larger values are clamped here
-    # and again at run time instead of being rejected.
-    max_attempts: int = Field(default=3, ge=1, le=3)
+    # and again at run time instead of being rejected. Since the no-repeat
+    # rotation upgrade the budget equals distinct candidate seats tried.
+    max_attempts: int = Field(default=3, ge=1, le=6)
     enabled: bool = True
     select_params: dict[str, str] | None = None
     select_context_path: str | None = None
@@ -113,7 +114,7 @@ class PlanData(BaseModel):
     @classmethod
     def clamp_attempts(cls, value):
         try:
-            return max(1, min(int(value), 3))
+            return max(1, min(int(value), 6))
         except (TypeError, ValueError):
             raise ValueError("尝试次数必须是数字")
 

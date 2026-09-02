@@ -184,12 +184,12 @@ def _make_plan(session_factory, account_id=1, seats=("001", "002", "003"), max_a
     return plan_id
 
 
-def test_candidate_seats_round_robin_with_one_global_budget(tmp_path, monkeypatch):
+def test_candidate_seats_each_get_exactly_one_shot(tmp_path, monkeypatch):
     import app.service as service
 
     factory = _test_session_factory(tmp_path)
-    # The plan asks for 5 rounds; the safety policy clamps it to 3 and the
-    # candidate list still wraps around.
+    # A confirmed-unavailable seat is never retried: with two candidates the
+    # budget buys one shot each, and the run stops once both are dead.
     plan_id = _make_plan(factory, seats=("001", "002"), max_attempts=5)
     calls = []
 
@@ -203,15 +203,14 @@ def test_candidate_seats_round_robin_with_one_global_budget(tmp_path, monkeypatc
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
-    monkeypatch.setattr(service, "_wait_between_attempts", lambda _: None)
-    monkeypatch.setattr(service, "_wait_first_pass", lambda _: None)
     execute_plan(plan_id)
-    assert calls == ["001", "002", "001"]
+    assert calls == ["001", "002"]
     db = factory()
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     assert run.status == "FAILED"
     assert run.error_code == "SEAT_UNAVAILABLE"
-    assert "钳制为 3" in run.message
+    assert "座位 001" in run.message and "座位 002" in run.message
+    assert len(run.attempt_details) == 2
     db.close()
 
 
@@ -597,11 +596,11 @@ def test_probe_with_select_params_checks_target_day_once_and_reports_each_seat(t
     db.close()
 
 
-def test_submit_rounds_are_clamped_to_three_and_select_params_are_passed(tmp_path, monkeypatch):
+def test_submit_rounds_are_clamped_to_six_and_select_params_are_passed(tmp_path, monkeypatch):
     import app.service as service
 
     factory = _test_session_factory(tmp_path)
-    plan_id = _make_plan(factory, seats=("001", "002"), max_attempts=5)
+    plan_id = _make_plan(factory, seats=("001", "002"), max_attempts=8)
     db = factory()
     plan = db.get(ReservationPlan, plan_id)
     plan.select_params_json = json.dumps({"deptIdEnc": "ABC"})
@@ -619,16 +618,58 @@ def test_submit_rounds_are_clamped_to_three_and_select_params_are_passed(tmp_pat
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
-    monkeypatch.setattr(service, "_wait_between_attempts", lambda _: None)
-    monkeypatch.setattr(service, "_wait_first_pass", lambda _: None)
     service.execute_plan(plan_id)
-    assert [seat for seat, _ in submits] == ["001", "002", "001"]
+    # Distinct seats only: no repeat of a confirmed-dead candidate.
+    assert [seat for seat, _ in submits] == ["001", "002"]
     assert all(params == {"deptIdEnc": "ABC"} for _, params in submits)
     db = factory()
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     assert (run.status, run.error_code) == ("FAILED", "SEAT_UNAVAILABLE")
-    assert "钳制为 3" in run.message
-    assert len(run.attempt_details) == 3
+    assert "钳制为 6" in run.message
+    assert len(run.attempt_details) == 2
+    db.close()
+
+
+def test_parallel_opening_shot_records_racers_and_first_winner(tmp_path, monkeypatch):
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("001", "002"), max_attempts=3)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+        def login(self): pass
+        def browse(self, *args, **kwargs): pass
+        def clone_authenticated(self): return FakeClient()
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+        def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
+            self.last_submitted = True
+            if seat == "001":
+                raise service.ReservationError("SEAT_UNAVAILABLE", "该时间段已被占用！")
+            return "预约成功"
+
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
+    monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "notify_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_scheduled_fire_epoch", lambda _plan: time.time())
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    monkeypatch.setattr(service, "_hold_until_fire", lambda *_args, **_kwargs: None)
+    service.execute_plan(plan_id, trigger="scheduled")
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    assert run.status == "SUCCESS"
+    assert run.selected_seat == "002"
+    assert "预约成功" in run.message
+    assert len(run.attempt_details) == 2
+    assert {item["seat"] for item in run.attempt_details} == {"001", "002"}
     db.close()
 
 
@@ -700,14 +741,15 @@ def test_migration_v8_normalizes_legacy_absolute_context_path(tmp_path, monkeypa
     connection.close()
 
 
-def test_wait_between_attempts_is_at_least_two_seconds(monkeypatch):
+def test_wait_between_attempts_is_short_and_jittered(monkeypatch):
     import app.service as service
 
     sleeps = []
     monkeypatch.setattr(service.time, "sleep", lambda seconds: sleeps.append(seconds))
     monkeypatch.setattr(service.random, "uniform", lambda low, high: 0.5)
     service._wait_between_attempts(time.monotonic() + 100)
-    assert sleeps == [pytest.approx(2.5)]
+    assert sleeps == [pytest.approx(0.5)]
+    assert service.RETRY_WAIT_RANGE[0] <= 0.5 <= service.RETRY_WAIT_RANGE[1]
 
 
 def test_parser_is_attribute_order_independent_and_supports_chaoxing_single_submit_enc_shape():

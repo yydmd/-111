@@ -311,6 +311,19 @@ class ChaoxingClient:
             raise ReservationError("LOGIN_FAILED", str(payload.get("msg2") or payload.get("msg") or "登录失败"))
         self.logged_in = True
 
+    def clone_authenticated(self) -> "ChaoxingClient":
+        """Copy this client's login state into an independent instance.
+
+        The opening-moment race submits several seats at once; one
+        requests.Session must not be shared across threads, so every racer
+        gets a clone carrying the same cookie jar (no re-login traffic).
+        """
+        clone = ChaoxingClient(self.username, self.password, slider_enabled=self.slider_enabled, deadline=self.deadline)
+        clone.session.cookies.update(self.session.cookies)
+        clone.logged_in = self.logged_in
+        clone.last_fid_enc = self.last_fid_enc
+        return clone
+
     def _parse_page(self, response: requests.Response) -> ProbeResult:
         # ChaoXing seat pages are UTF-8. requests may otherwise select a legacy
         # fallback encoding, which makes Chinese state markers impossible to match.

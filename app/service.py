@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from . import chaoxing_client as _chaoxing_client
 from . import clock as app_clock
-from .chaoxing_client import ChaoxingClient, ReservationError
+from .chaoxing_client import CAPTCHA_TYPES, ChaoxingClient, ProbeResult, ReservationError
 from .notify import submit_async as notify_async
 from .db import Account, ReservationPlan, ReservationRun, SessionLocal
 from .security import decrypt_password, redact
@@ -27,18 +27,33 @@ MAX_ACCOUNT_WORKERS = 4
 DUPLICATE_COOLDOWN_SECONDS = 5 * 60
 # Risk-control cap: a whole plan tries at most this many submit rounds no
 # matter what older plans stored (GitHub issue #89: high-frequency requests
-# triggered account risk warnings).
-MAX_SUBMIT_ATTEMPTS = 3
-# Errors that make every remaining candidate seat pointless and must stop the
-# run immediately instead of hammering the platform.
-_RETRYABLE_CODES = {"SEAT_UNAVAILABLE"}
-# Opening-window discipline: the scheduler wakes LEAD seconds early, login and
-# browsing warm up, the token is pre-fetched shortly before the moment, and the
-# submit fires a human-reaction jitter after the platform's own clock reaches
-# the run time. Fast, but never machine-precise.
-FIRE_JITTER_RANGE = (0.15, 0.5)
+# triggered account risk warnings). Since the no-repeat rotation upgrade the
+# budget buys one shot per *distinct* candidate seat, so the cap also limits
+# how large a candidate pool can be fully swept in a single run.
+MAX_SUBMIT_ATTEMPTS = 6
+# Errors that make another candidate (or a retry after the opening switch)
+# worth trying instead of stopping the run. TARGET_*_UNCOVERABLE/NOT_OPEN are
+# what the platform answers in the milliseconds before the window really
+# switches, so an opening-moment shot must rotate/retry rather than die.
+_RETRYABLE_CODES = {"SEAT_UNAVAILABLE", "TARGET_CONTEXT_UNAVAILABLE", "TARGET_DAY_NOT_OPEN"}
+# Opening-window discipline, bot-race edition: the scheduler wakes LEAD
+# seconds early, login and browsing warm up, one poller re-fetches the
+# target-day page ever more densely through the opening moment (a single
+# early fetch only ever sees the not-open page), and the submit fires on the
+# platform's own clock with only token jitter left.
+FIRE_JITTER_RANGE = (0.0, 0.05)
 PREFETCH_LEAD_SECONDS = 2.0
-FIRST_PASS_WAIT_RANGE = (0.25, 0.4)
+# Poll cadence of the opening race: relaxed while the moment is far away,
+# dense only around the switch itself so total traffic stays bounded.
+OPENING_POLL_RELAXED = 0.2
+OPENING_POLL_DENSE = 0.06
+DENSE_WINDOW_BEFORE_FIRE = 0.3
+OPENING_GRACE_SECONDS = 3.0
+FIRE_BUSY_STEP = 0.005
+FIRST_PASS_WAIT_RANGE = (0.05, 0.15)
+RETRY_WAIT_RANGE = (0.3, 0.6)
+# How many candidate seats submit simultaneously at the opening moment.
+PARALLEL_SEAT_LIMIT = 4
 _NOTIFY_STATUSES = {"SUCCESS", "FAILED", "SKIPPED", "NEEDS_VERIFICATION", "BLOCKED_BY_RISK"}
 _executor = ThreadPoolExecutor(max_workers=MAX_ACCOUNT_WORKERS, thread_name_prefix="reserve")
 _account_locks: dict[int, threading.Lock] = {}
@@ -261,8 +276,9 @@ def _failure_status(code: str) -> str:
 
 
 def _wait_between_attempts(deadline: float) -> None:
-    # At least 2 seconds plus jitter; fast retries are what trips risk control.
-    delay = 2.0 + random.uniform(0.0, 1.0)
+    # A short, jittered spacing: dense enough for an opening race against
+    # other programs, sparse enough not to look like a hammer.
+    delay = random.uniform(*RETRY_WAIT_RANGE)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ReservationError("DEADLINE_EXCEEDED", "任务超过 60 秒运行上限")
@@ -283,20 +299,61 @@ def _scheduled_fire_epoch(plan: ReservationPlan) -> float | None:
     """Server-clock epoch when a scheduled run may submit.
 
     The plan's run time is treated as the platform's wall-clock opening moment;
-    a fresh clock offset is measured right before the decisive wait. A small
-    random jitter keeps every day's firing time human-irregular. Runs that
-    already missed the moment fire immediately instead of waiting a day.
+    a dense clock calibration runs right before the decisive wait (see
+    ``clock.refresh(dense=True)``). A small random jitter keeps every day's
+    firing time from being bit-identical. Runs that already missed the moment
+    fire immediately instead of waiting a day.
     """
     try:
         hour, minute = map(int, plan.run_time.split(":", 1))
     except ValueError:
         return None
-    app_clock.refresh()
+    app_clock.refresh(dense=True)
     now_epoch = app_clock.server_now()
     now_server = dt.datetime.fromtimestamp(now_epoch, SHANGHAI)
     target = now_server.replace(hour=hour, minute=minute, second=0, microsecond=0) + dt.timedelta(seconds=random.uniform(*FIRE_JITTER_RANGE))
     target_epoch = target.timestamp()
     return target_epoch if target_epoch > now_epoch else now_epoch
+
+
+def _hold_until_fire(fire_epoch: float) -> None:
+    """Busy-wait the last sliver so the submit lands just past the moment."""
+    while True:
+        remaining = fire_epoch - app_clock.server_now()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, FIRE_BUSY_STEP))
+
+
+def _poll_until_open(client: ChaoxingClient, fire_epoch: float, request_values: dict, target_day: dt.date) -> ProbeResult | None:
+    """Re-fetch the target-day select page through the opening moment.
+
+    Before the window opens the platform answers a perfectly valid request
+    with its not-open error page, so one early fetch is worthless: the race is
+    decided by whoever re-fetches within milliseconds of the switch. Poll with
+    one cheap GET, relaxed early and dense only around the decisive moment.
+    Returns the first usable page, or None when the window never opened within
+    the grace period (the serial submit path then re-resolves on its own).
+    """
+    # Wait quietly until the prefetch lead window begins.
+    while True:
+        remaining = fire_epoch - app_clock.server_now()
+        if remaining <= PREFETCH_LEAD_SECONDS:
+            break
+        time.sleep(min(remaining - PREFETCH_LEAD_SECONDS, 0.2))
+    context = request_values["select_params"] or {"id": request_values["room_id"].strip()}
+    select_path = request_values["select_context_path"]
+    while app_clock.server_now() <= fire_epoch + OPENING_GRACE_SECONDS:
+        try:
+            result = client.fetch_target_day_page(target_day, dict(context), select_path)
+        except ReservationError:
+            result = None
+        if result is not None and (result.ok or result.captcha_type in CAPTCHA_TYPES):
+            return result
+        remaining = fire_epoch - app_clock.server_now()
+        interval = OPENING_POLL_DENSE if remaining <= DENSE_WINDOW_BEFORE_FIRE else OPENING_POLL_RELAXED
+        time.sleep(interval)
+    return None
 
 
 def _await_fire_and_prefetch(
@@ -306,34 +363,101 @@ def _await_fire_and_prefetch(
     target_day: dt.date,
     seat: str,
 ):
-    """Block until just before the opening moment, pre-fetch the submit
-    parameters, then hold fire until the (jittered) server time arrives.
+    """Block until the window opens, then hand the caller a fresh page.
 
-    Returns the pre-fetched ProbeResult for the first submit, or None when the
-    pre-fetch failed — the submit path then resolves parameters itself.
+    Returns the resolved ProbeResult for the first submit, or None when the
+    window did not open in time — the submit path then resolves itself.
     """
-    while True:
-        remaining = fire_epoch - app_clock.server_now()
-        if remaining <= PREFETCH_LEAD_SECONDS:
-            break
-        time.sleep(min(remaining - PREFETCH_LEAD_SECONDS, 0.2))
-    pre = None
-    if fire_epoch - app_clock.server_now() > 0:
+    pre = _poll_until_open(client, fire_epoch, request_values, target_day)
+    if pre is None:
+        return None
+    # The window may have opened before the planned moment; never submit early.
+    _hold_until_fire(fire_epoch)
+    return pre
+
+
+def _parallel_opening_shot(
+    client: ChaoxingClient,
+    request_values: dict,
+    target_day: dt.date,
+    seats: list[str],
+    fire_epoch: float,
+    deadline: float,
+):
+    """Opening-moment race: one dense poller, then every candidate submits.
+
+    The poller detects the switch; each racer then resolves its own fresh page
+    on a cloned session (one GET, in parallel) and submits its seat the moment
+    the server clock allows. First success stops the rest. Returns
+    ``(outcomes, winner)`` where outcomes audit every racer and winner is the
+    successful outcome dict, or ``( [], None )`` when the window never opened
+    and the serial fallback must take over.
+    """
+    room_id = request_values["room_id"]
+    start_time = request_values["start_time"]
+    end_time = request_values["end_time"]
+    select_params = request_values["select_params"]
+    select_path = request_values["select_context_path"]
+    select_source = request_values["select_context_source"]
+    workers = seats[:PARALLEL_SEAT_LIMIT]
+
+    pre = _poll_until_open(client, fire_epoch, request_values, target_day)
+    if pre is None:
+        return [], None
+
+    outcomes: list[dict] = []
+    winner: dict | None = None
+    guard = threading.Lock()
+    stop = threading.Event()
+
+    def race(seat: str) -> None:
+        nonlocal winner
+        if stop.is_set():
+            return
+        racer = client.clone_authenticated()
+        resolved = None
         try:
-            pre = client.resolve_submission_page(
-                request_values["room_id"], seat, target_day,
-                select_params=request_values["select_params"],
-                select_path=request_values["select_context_path"],
-                select_source=request_values["select_context_source"],
+            resolved = racer.resolve_submission_page(
+                room_id, seat, target_day,
+                select_params=select_params, select_path=select_path, select_source=select_source,
             )
         except ReservationError:
-            pre = None  # transient: submit re-resolves at fire time
-    while True:
-        remaining = fire_epoch - app_clock.server_now()
-        if remaining <= 0:
-            break
-        time.sleep(min(remaining, 0.02))
-    return pre
+            resolved = None
+        if resolved is None:
+            # Last resort: the poller's page may still carry a usable token.
+            if not (pre is not None and pre.ok and pre.captcha_type not in CAPTCHA_TYPES):
+                return
+            resolved = pre
+        _hold_until_fire(fire_epoch)
+        if stop.is_set():
+            return
+        try:
+            message = racer.submit_once(
+                room_id, seat, start_time, end_time, target_day,
+                select_params=select_params, select_path=select_path, select_source=select_source,
+                pre_resolved=resolved,
+            )
+        except ReservationError as exc:
+            with guard:
+                outcomes.append({
+                    "seat": seat, "code": exc.code, "message": exc.message,
+                    "submitted": bool(getattr(racer, "last_submitted", False)),
+                    "source": getattr(racer, "last_parameter_source", "") or "unknown",
+                })
+            return
+        with guard:
+            outcomes.append({"seat": seat, "code": None, "message": message, "submitted": True,
+                             "source": getattr(racer, "last_parameter_source", "") or "unknown"})
+            if winner is None:
+                winner = outcomes[-1]
+                stop.set()
+
+    threads = [threading.Thread(target=race, args=(seat,), name=f"opening-{seat}", daemon=True) for seat in workers]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    return outcomes, winner
 
 
 def recover_interrupted_runs() -> int:
@@ -603,6 +727,8 @@ def execute_plan(
             return run.id
         target_day = dt.date.fromisoformat(run.target_date or _target_day(plan).isoformat())
         pre_resolved = None
+        parallel_outcomes: list[dict] = []
+        winner: dict | None = None
         if trigger in {"scheduled", "scheduled_catchup"}:
             fire_epoch = _scheduled_fire_epoch(plan)
             if fire_epoch is not None:
@@ -611,14 +737,41 @@ def execute_plan(
                 run.message = "已提前唤醒，预热会话并等待开抢时刻"
                 db.commit()
                 client.browse(request_values["room_id"], seats[0])
-                pre_resolved = _await_fire_and_prefetch(client, fire_epoch, request_values, target_day, seats[0])
-        attempts = min(plan.max_attempts, MAX_SUBMIT_ATTEMPTS)
+                if len(seats) > 1:
+                    parallel_outcomes, winner = _parallel_opening_shot(client, request_values, target_day, seats, fire_epoch, deadline)
+                    for outcome in parallel_outcomes:
+                        _append_attempt(
+                            run,
+                            seat=outcome["seat"],
+                            source=outcome["source"],
+                            submitted=outcome["submitted"],
+                            code=outcome["code"],
+                            message=outcome["message"],
+                        )
+                        messages.append(f"开抢并行，座位 {outcome['seat']}：{outcome['code'] or 'SUCCESS'} {outcome['message']}")
+                    if winner is not None:
+                        _persist_discovered_context(plan, client)
+                        run.selected_seat = winner["seat"]
+                        run.parameter_source = winner["source"]
+                        run.status = "SUCCESS"
+                        run.error_code = None
+                        run.message = redact(f"座位 {winner['seat']}：{winner['message']}")
+                        return run.id
+                else:
+                    pre_resolved = _await_fire_and_prefetch(client, fire_epoch, request_values, target_day, seats[0])
+        attempts = min(max(plan.max_attempts, len(seats)), MAX_SUBMIT_ATTEMPTS)
         if plan.max_attempts > MAX_SUBMIT_ATTEMPTS:
             messages.append(f"按安全策略将尝试次数从 {plan.max_attempts} 钳制为 {MAX_SUBMIT_ATTEMPTS}")
-        for attempt in range(attempts):
+        # A confirmed-unavailable seat is dead: never spend another submit on
+        # it. The parallel opening shot may already have consumed candidates.
+        dead_seats = {outcome["seat"] for outcome in parallel_outcomes if outcome["code"] == "SEAT_UNAVAILABLE"}
+        used_attempts = sum(1 for outcome in parallel_outcomes if outcome["submitted"])
+        for attempt in range(used_attempts, attempts):
             if time.monotonic() >= deadline:
                 raise ReservationError("DEADLINE_EXCEEDED", "任务超过 60 秒运行上限")
-            seat = seats[attempt % len(seats)]
+            seat = next((candidate for candidate in seats if candidate not in dead_seats), None)
+            if seat is None:
+                break  # every candidate is confirmed taken; stop hammering
             run.selected_seat = seat
             try:
                 message = client.submit_once(
@@ -654,6 +807,8 @@ def execute_plan(
                     message=exc.message,
                 )
                 messages.append(f"第 {attempt + 1} 次，座位 {seat}：{exc.code} {exc.message}")
+                if exc.code == "SEAT_UNAVAILABLE":
+                    dead_seats.add(seat)
                 if exc.code == "SUBMIT_OUTCOME_UNKNOWN":
                     # The POST may have landed; ask the platform instead of a human.
                     state, detail = _verify_duplicate_on_server(client, request_values, target_day)
@@ -665,12 +820,15 @@ def execute_plan(
                     if detail:
                         messages.append(f"自动核实：{detail}")
                 if exc.code in _RETRYABLE_CODES:
-                    if attempt + 1 < attempts:
-                        if attempt + 1 < len(seats):
-                            _wait_first_pass(deadline)
-                        else:
-                            _wait_between_attempts(deadline)
-                    continue
+                    live_seats_remain = any(candidate not in dead_seats for candidate in seats)
+                    if live_seats_remain:
+                        if attempt + 1 < attempts:
+                            if attempt + 1 < len(seats):
+                                _wait_first_pass(deadline)
+                            else:
+                                _wait_between_attempts(deadline)
+                        continue
+                    break  # every candidate confirmed taken; stop hammering
                 _set_failure(run, exc.code, "; ".join(messages), status=_failure_status(exc.code))
                 return run.id
         _set_failure(run, "SEAT_UNAVAILABLE", "; ".join(messages) or "所有候选座位均不可预约")

@@ -7,7 +7,9 @@ expose a ``server_now()`` the submit gate can wait on.
 
 The measurement is deliberately cheap: any response (even a redirect) carries
 a ``Date`` header with one-second granularity; we sample the midpoint of the
-request window and take the median of a few samples.
+request window, keep the fastest half of the samples (least one-way-latency
+skew) and compensate the header's second-truncation bias. A dense mode takes
+extra samples for the race-grade pre-fire calibration.
 """
 from __future__ import annotations
 
@@ -27,9 +29,15 @@ PROBE_URLS = (
     "https://passport2.chaoxing.com/mlogin?loginType=1",
 )
 MAX_SAMPLES = 3
+# Race-grade calibration used right before an opening-window submit.
+DENSE_SAMPLES = 8
 TTL_SECONDS = 10 * 60
 # Refuse absurd offsets: if the "server" claims more than this, keep local time.
 SANITY_LIMIT_SECONDS = 300.0
+# HTTP ``Date`` headers truncate the server clock to whole seconds, so every
+# sample is biased about half a second early; an opening race cannot afford
+# to fire that much before the platform's own moment.
+DATE_HEADER_BIAS_SECONDS = 0.5
 
 _session = requests.Session()
 _session.trust_env = False
@@ -39,7 +47,8 @@ _measured_at = 0.0
 _last_error = ""
 
 
-def _measure_once(url: str) -> float | None:
+def _measure_once(url: str) -> tuple[float, float] | None:
+    """Return ``(rtt, offset)`` for one probe, or None when undecodable."""
     before = time.time()
     response = _session.get(url, timeout=(2, 4), allow_redirects=False,
                             headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
@@ -51,27 +60,36 @@ def _measure_once(url: str) -> float | None:
         server = parsedate_to_datetime(raw_date).timestamp()
     except (TypeError, ValueError, OverflowError):
         return None
-    return server - (before + after) / 2
+    return after - before, server - (before + after) / 2
 
 
-def refresh() -> float:
-    """Re-measure the server offset; returns the applied offset in seconds."""
+def refresh(dense: bool = False) -> float:
+    """Re-measure the server offset; returns the applied offset in seconds.
+
+    ``dense=True`` gathers more samples for the decisive pre-fire wait. The
+    estimator averages the offsets of the *fastest* half of the samples
+    (NTP-style filtering: short round trips carry the least one-way-latency
+    skew) and compensates the second-truncation bias of the Date header.
+    """
     global _offset, _measured_at, _last_error
-    samples: list[float] = []
-    for url in PROBE_URLS:
-        if len(samples) >= MAX_SAMPLES:
-            break
+    wanted = DENSE_SAMPLES if dense else MAX_SAMPLES
+    samples: list[tuple[float, float]] = []
+    attempts = 0
+    while len(samples) < wanted and attempts < wanted * 2:
+        url = PROBE_URLS[attempts % len(PROBE_URLS)]
+        attempts += 1
         try:
-            value = _measure_once(url)
+            measured = _measure_once(url)
         except requests.RequestException as exc:
             logger.debug("clock probe failed for %s: %s", url, exc.__class__.__name__)
             continue
-        if value is not None:
-            samples.append(value)
+        if measured is not None:
+            samples.append(measured)
     with _lock:
         if samples:
-            samples.sort()
-            offset = samples[len(samples) // 2]
+            samples.sort(key=lambda item: item[0])
+            fastest = [offset for _, offset in samples[: max(1, len(samples) // 2)]]
+            offset = sum(fastest) / len(fastest) + DATE_HEADER_BIAS_SECONDS
             if abs(offset) <= SANITY_LIMIT_SECONDS:
                 _offset = offset
                 _last_error = ""
