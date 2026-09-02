@@ -423,7 +423,20 @@ def _migrate_database() -> None:
 
 
 def init_db() -> None:
-    Base.metadata.create_all(engine)
+    # A brand-new SQLite file has user_version=0.  Building the latest ORM
+    # schema and then treating it as a legacy v0 database would attempt to add
+    # columns that already exist.  Stamp new files atomically; only existing
+    # files take the preserving migration path.
+    is_new = not DATABASE_PATH.exists() or DATABASE_PATH.stat().st_size == 0
+    if is_new:
+        Base.metadata.create_all(engine)
+        connection = sqlite3.connect(DATABASE_PATH)
+        try:
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            connection.commit()
+        finally:
+            connection.close()
+        return
     _migrate_database()
     Base.metadata.create_all(engine)
 

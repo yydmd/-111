@@ -698,6 +698,21 @@ def test_migration_v8_normalizes_legacy_absolute_context_path(tmp_path, monkeypa
     connection.close()
 
 
+def test_init_db_stamps_a_new_database_without_legacy_rebuild(tmp_path, monkeypatch):
+    import app.db as db_module
+
+    database_path = tmp_path / "fresh.db"
+    engine = create_engine(f"sqlite:///{database_path.as_posix()}")
+    monkeypatch.setattr(db_module, "DATABASE_PATH", database_path)
+    monkeypatch.setattr(db_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(db_module, "engine", engine)
+    db_module.init_db()
+    connection = __import__("sqlite3").connect(database_path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert "stage" in {row[1] for row in connection.execute("PRAGMA table_info(reservation_runs)")}
+    connection.close()
+
+
 def test_wait_between_attempts_is_at_least_two_seconds(monkeypatch):
     import app.service as service
 
