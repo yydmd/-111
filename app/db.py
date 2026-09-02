@@ -17,7 +17,7 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DATABASE_PATH = DATA_DIR / "app.db"
 DATABASE_URL = f"sqlite:///{DATABASE_PATH.as_posix()}"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 _SELECT_CONTEXT_PATH_RE = re.compile(r"/front/(?:third/)?apps/seat/select", re.I)
 
 
@@ -128,6 +128,14 @@ class ReservationRun(Base):
     attempt_details_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Immutable, non-secret plan values accepted when this run entered the queue.
     request_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The current state-machine stage is intentionally separate from the final
+    # status.  A page refresh can therefore explain what a live task is doing.
+    stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    wake_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    clock_offset_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    verified_reservation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    verified_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -161,6 +169,22 @@ class ReservationRun(Base):
         except (TypeError, json.JSONDecodeError):
             return {}
         return data if isinstance(data, dict) else {}
+
+
+class ReservationRunEvent(Base):
+    """Append-only, non-secret event timeline for a reservation run."""
+
+    __tablename__ = "reservation_run_events"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("reservation_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    details_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -270,6 +294,25 @@ def _migrate_database() -> None:
                         "UPDATE reservation_plans SET select_context_path=? WHERE id=?",
                         (canonical_path, plan_id),
                     )
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            version = 9
+        if version == 9:
+            # v10: observable state machine.  Additive migration preserves
+            # existing plans, run history and DPAPI-encrypted credentials.
+            runs_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reservation_runs'"
+            ).fetchone()
+            if runs_exists:
+                connection.execute("ALTER TABLE reservation_runs ADD COLUMN stage VARCHAR(32)")
+                connection.execute("ALTER TABLE reservation_runs ADD COLUMN scheduled_for DATETIME")
+                connection.execute("ALTER TABLE reservation_runs ADD COLUMN wake_at DATETIME")
+                connection.execute("ALTER TABLE reservation_runs ADD COLUMN clock_offset_ms INTEGER")
+                connection.execute("ALTER TABLE reservation_runs ADD COLUMN verified_reservation_id VARCHAR(128)")
+                connection.execute("ALTER TABLE reservation_runs ADD COLUMN verified_status VARCHAR(32)")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS reservation_run_events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES reservation_runs(id) ON DELETE CASCADE, sequence INTEGER NOT NULL, stage VARCHAR(32) NOT NULL, code VARCHAR(64), message TEXT NOT NULL DEFAULT '', details_json TEXT, created_at DATETIME NOT NULL)"
+            )
+            connection.execute("CREATE INDEX IF NOT EXISTS ix_reservation_run_events_run_id ON reservation_run_events(run_id)")
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             connection.commit()
             return

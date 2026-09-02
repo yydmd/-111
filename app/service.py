@@ -16,7 +16,7 @@ from . import chaoxing_client as _chaoxing_client
 from . import clock as app_clock
 from .chaoxing_client import ChaoxingClient, ReservationError
 from .notify import submit_async as notify_async
-from .db import Account, ReservationPlan, ReservationRun, SessionLocal
+from .db import Account, ReservationPlan, ReservationRun, ReservationRunEvent, SessionLocal
 from .security import decrypt_password, redact
 from .validation import normalize_time, validate_reservation_time_range
 
@@ -36,9 +36,11 @@ _RETRYABLE_CODES = {"SEAT_UNAVAILABLE"}
 # browsing warm up, the token is pre-fetched shortly before the moment, and the
 # submit fires a human-reaction jitter after the platform's own clock reaches
 # the run time. Fast, but never machine-precise.
-FIRE_JITTER_RANGE = (0.15, 0.5)
+FIRE_JITTER_RANGE = (0.05, 0.12)
 PREFETCH_LEAD_SECONDS = 2.0
 FIRST_PASS_WAIT_RANGE = (0.25, 0.4)
+TARGET_PARAMETER_RETRY_SECONDS = (0.0, 0.10, 0.25, 0.50, 0.90, 1.40, 2.10, 3.00, 4.00, 5.00)
+VERIFY_RETRY_SECONDS = (0.2, 0.6, 1.2, 2.2, 3.5, 5.0)
 _NOTIFY_STATUSES = {"SUCCESS", "FAILED", "SKIPPED", "NEEDS_VERIFICATION", "BLOCKED_BY_RISK"}
 _executor = ThreadPoolExecutor(max_workers=MAX_ACCOUNT_WORKERS, thread_name_prefix="reserve")
 _account_locks: dict[int, threading.Lock] = {}
@@ -100,6 +102,7 @@ def _run_snapshot(plan: ReservationPlan, trigger: str) -> ReservationRun:
         request_snapshot_json=json.dumps(request_snapshot, ensure_ascii=False),
         trigger=trigger,
         status="PENDING",
+        stage="PENDING",
         message="等待执行",
     )
 
@@ -137,8 +140,20 @@ def enqueue_plan(
 
 def _set_failure(run: ReservationRun, code: str, message: str, *, status: str = "FAILED") -> None:
     run.status = status
+    run.stage = "FAILED" if status != "MISSED" else "MISSED"
     run.error_code = code
     run.message = redact(message)
+
+
+def _set_stage(db, run: ReservationRun, stage: str, message: str, code: str | None = None, details: dict | None = None) -> None:
+    """Record a short, secret-free explanation for every material transition."""
+    run.stage = stage
+    run.message = redact(message)
+    sequence = int(db.scalar(select(__import__("sqlalchemy").func.count()).select_from(ReservationRunEvent).where(ReservationRunEvent.run_id == run.id)) or 0) + 1
+    db.add(ReservationRunEvent(
+        run_id=run.id, sequence=sequence, stage=stage, code=code,
+        message=redact(message), details_json=json.dumps(details, ensure_ascii=False) if details else None,
+    ))
 
 
 def _append_attempt(run: ReservationRun, *, seat: str, source: str, submitted: bool, code: str | None, message: str) -> None:
@@ -252,6 +267,33 @@ def _verify_duplicate_on_server(client: ChaoxingClient, request_values: dict, ta
     return "found", _server_reservation_brief(match)
 
 
+def _verify_submission_with_poll(client: ChaoxingClient, request_values: dict, target_day: dt.date) -> tuple[dict | None, str]:
+    """Use the authoritative current-reservations list after every POST.
+
+    A positive POST response is not a success until the platform's own list
+    contains the reservation.  This prevents duplicate re-submission when a
+    response is stale, proxied, or only superficially successful.
+    """
+    last_detail = ""
+    started = time.monotonic()
+    for delay in VERIFY_RETRY_SECONDS:
+        remaining = started + delay - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        state, detail = _verify_duplicate_on_server(client, request_values, target_day)
+        if state == "found":
+            try:
+                reservations = client.fetch_reservations(request_values.get("select_params"), request_values.get("select_context_path"))
+                return _chaoxing_client.ChaoxingClient.find_reservation(
+                    reservations, target_day, request_values["room_id"], request_values["start_time"], request_values["end_time"]
+                ), detail
+            except Exception:
+                return {"id": None}, detail
+        if detail:
+            last_detail = detail
+    return None, last_detail
+
+
 def _failure_status(code: str) -> str:
     if code in {"NEEDS_VERIFICATION", "CAPTCHA_REQUIRED", "SECURITY_CHALLENGE", "LOGIN_REQUIRED", "INTERRUPTED_NEEDS_VERIFICATION", "SUBMIT_OUTCOME_UNKNOWN", "SUBMIT_REJECTED"}:
         return "NEEDS_VERIFICATION"
@@ -296,7 +338,8 @@ def _scheduled_fire_epoch(plan: ReservationPlan) -> float | None:
     now_server = dt.datetime.fromtimestamp(now_epoch, SHANGHAI)
     target = now_server.replace(hour=hour, minute=minute, second=0, microsecond=0) + dt.timedelta(seconds=random.uniform(*FIRE_JITTER_RANGE))
     target_epoch = target.timestamp()
-    return target_epoch if target_epoch > now_epoch else now_epoch
+    # A restarted service must never turn a missed window into a late submit.
+    return target_epoch if target_epoch > now_epoch else None
 
 
 def _await_fire_and_prefetch(
@@ -529,7 +572,7 @@ def execute_plan(
                         run.message = f"已确认忽略旧成功记录 #{duplicate.id}，正在继续预约"
         run.status = "RUNNING"
         if run.message in {"", "等待执行", "开始执行"}:
-            run.message = "正在登录并准备预约"
+            _set_stage(db, run, "PREPARING", "正在登录并准备预约")
         db.commit()
         client.login()
         seats = request_values["seats"]
@@ -567,6 +610,7 @@ def execute_plan(
                         for seat in seats
                     )
                     run.status = "PROBE_DONE"
+                    _set_stage(db, run, "WAITING_OPEN", wait_message, "TARGET_DAY_NOT_OPEN")
                     run.error_code = "PROBE_WAITING_OPEN"
                     run.parameter_source = "target_day_at_opening"
                     run.probe_results_json = json.dumps(probe_results, ensure_ascii=False)
@@ -596,6 +640,7 @@ def execute_plan(
                         probe_ok = False
                     probe_results.append({"seat": seat, "page_state": page_result.page_state, "ok": probe_ok, "message": redact(message)})
             run.status = "PROBE_DONE"
+            _set_stage(db, run, "READY", "目标日页面预检完成", "PROBE_COMPLETE")
             run.error_code = "PROBE_COMPLETE"
             run.probe_results_json = json.dumps(probe_results, ensure_ascii=False)
             summary = "；".join(f"座位 {item['seat']}：{item['message']}" for item in probe_results if item["seat"] != "-")
@@ -605,21 +650,23 @@ def execute_plan(
         pre_resolved = None
         if trigger in {"scheduled", "scheduled_catchup"}:
             fire_epoch = _scheduled_fire_epoch(plan)
+            if fire_epoch is None:
+                _set_failure(run, "MISSED_OPENING_WINDOW", "已错过平台开放时间；系统按安全策略未进行补抢", status="MISSED")
+                return run.id
             if fire_epoch is not None:
                 # Warm the session like a person already sitting on the page,
                 # then hold the submit until the platform's own clock says so.
-                run.message = "已提前唤醒，预热会话并等待开抢时刻"
+                _set_stage(db, run, "WAITING_OPEN", "已提前唤醒，预热会话并等待开抢时刻")
                 db.commit()
                 client.browse(request_values["room_id"], seats[0])
                 pre_resolved = _await_fire_and_prefetch(client, fire_epoch, request_values, target_day, seats[0])
-        attempts = min(plan.max_attempts, MAX_SUBMIT_ATTEMPTS)
-        if plan.max_attempts > MAX_SUBMIT_ATTEMPTS:
-            messages.append(f"按安全策略将尝试次数从 {plan.max_attempts} 钳制为 {MAX_SUBMIT_ATTEMPTS}")
-        for attempt in range(attempts):
+        # A candidate is an ordered one-shot choice, never a retry budget.
+        candidates = seats[:MAX_SUBMIT_ATTEMPTS]
+        for attempt, seat in enumerate(candidates):
             if time.monotonic() >= deadline:
                 raise ReservationError("DEADLINE_EXCEEDED", "任务超过 60 秒运行上限")
-            seat = seats[attempt % len(seats)]
             run.selected_seat = seat
+            _set_stage(db, run, "SUBMITTING", f"正在提交候选座位 {seat}")
             try:
                 message = client.submit_once(
                     request_values["room_id"], seat, request_values["start_time"], request_values["end_time"], target_day,
@@ -637,9 +684,17 @@ def execute_plan(
                     code=None,
                     message=message,
                 )
-                run.status = "SUCCESS"
-                run.error_code = None
-                run.message = redact(f"座位 {seat}：{message}")
+                _set_stage(db, run, "VERIFYING", f"座位 {seat}：平台已响应，正在核实超星端记录")
+                verified, detail = _verify_submission_with_poll(client, request_values, target_day)
+                if verified is not None:
+                    run.status = "SUCCESS"
+                    run.stage = "SUCCESS"
+                    run.error_code = None
+                    run.verified_reservation_id = str(verified.get("id") or verified.get("reserveId") or verified.get("uuid") or "") or None
+                    run.verified_status = str(verified.get("status") or "confirmed")
+                    run.message = redact(f"座位 {seat}：预约已由超星端确认（{detail}）")
+                    return run.id
+                _set_failure(run, "POST_SUCCESS_UNCONFIRMED", f"座位 {seat}：提交已响应成功，但未在超星端预约列表确认；请人工核实{('（' + detail + '）') if detail else ''}", status="NEEDS_VERIFICATION")
                 return run.id
             except ReservationError as exc:
                 source = getattr(client, "last_parameter_source", "") or "unknown"
@@ -656,20 +711,21 @@ def execute_plan(
                 messages.append(f"第 {attempt + 1} 次，座位 {seat}：{exc.code} {exc.message}")
                 if exc.code == "SUBMIT_OUTCOME_UNKNOWN":
                     # The POST may have landed; ask the platform instead of a human.
-                    state, detail = _verify_duplicate_on_server(client, request_values, target_day)
-                    if state == "found":
+                    _set_stage(db, run, "VERIFYING", f"座位 {seat}：提交结果未知，正在核实超星端记录")
+                    verified, detail = _verify_submission_with_poll(client, request_values, target_day)
+                    if verified is not None:
                         run.status = "SUCCESS"
+                        run.stage = "SUCCESS"
                         run.error_code = None
+                        run.verified_reservation_id = str(verified.get("id") or verified.get("reserveId") or verified.get("uuid") or "") or None
+                        run.verified_status = str(verified.get("status") or "confirmed")
                         run.message = redact(f"座位 {seat}：提交响应丢失，经超星端核实预约已生效（{detail}）")
                         return run.id
-                    if detail:
-                        messages.append(f"自动核实：{detail}")
+                    _set_failure(run, "SUBMIT_OUTCOME_UNKNOWN", f"座位 {seat}：提交结果未知，未在超星端确认；请人工核实{('（' + detail + '）') if detail else ''}", status="NEEDS_VERIFICATION")
+                    return run.id
                 if exc.code in _RETRYABLE_CODES:
-                    if attempt + 1 < attempts:
-                        if attempt + 1 < len(seats):
-                            _wait_first_pass(deadline)
-                        else:
-                            _wait_between_attempts(deadline)
+                    if attempt + 1 < len(candidates):
+                        _wait_first_pass(deadline)
                     continue
                 _set_failure(run, exc.code, "; ".join(messages), status=_failure_status(exc.code))
                 return run.id

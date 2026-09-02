@@ -1,6 +1,6 @@
 """Single-instance watchdog for the local ChaoXing reservation service.
 
-The watchdog starts ``main.py -m serve``, probes ``/health``, and replaces the
+The watchdog starts ``main.py``, probes ``/health``, and replaces the
 service process after an abnormal exit or when the HTTP endpoint stops responding.
 It is intentionally small: persistent scheduling remains in SQLite/APScheduler,
 while this process only provides supervision.
@@ -28,7 +28,7 @@ import requests
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 PYTHON = PYTHON if PYTHON.exists() else Path(sys.executable)
-SERVICE_COMMAND = [str(PYTHON), "-u", "main.py", "-m", "serve"]
+SERVICE_COMMAND = [str(PYTHON), "-u", "main.py"]
 
 DATA_DIR = ROOT / "data"
 LOG_DIR = DATA_DIR / "logs"

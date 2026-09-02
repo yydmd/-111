@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from .chaoxing_client import EPHEMERAL_SELECT_KEYS, normalize_select_context_path, parse_select_context_url
 from . import clock, notify
-from .db import Account, PlanSeat, ReservationPlan, ReservationRun, get_db, init_db
+from .db import Account, PlanSeat, ReservationPlan, ReservationRun, ReservationRunEvent, get_db, init_db
 from .scheduler import refresh_jobs, scheduler, start_scheduler, stop_scheduler
 from .security import encrypt_password
 from .service import active_run_count, enqueue_plan, recover_interrupted_runs
@@ -260,7 +260,9 @@ def _apply_plan_data(plan: ReservationPlan, data: PlanData) -> None:
     plan.day_offset = data.day_offset
     plan.weekdays_json = json.dumps(data.weekdays)
     plan.slider_enabled = data.slider_enabled
-    plan.max_attempts = data.max_attempts
+    # Candidate order is the one-shot execution policy.  Retain the legacy
+    # field for old browser tabs, but never let it suppress a valid fallback.
+    plan.max_attempts = len(data.seats)
     plan.enabled = data.enabled
     plan.select_params_json = json.dumps(data.select_params, ensure_ascii=False) if data.select_params else None
     plan.select_context_path = data.select_context_path if data.select_params else None
@@ -424,6 +426,19 @@ def probe_plan(plan_id: int, db: Session = Depends(get_db)):
     return {"accepted": True, "mode": "probe", "run_id": enqueue_plan(plan_id, "probe", probe_only=True)}
 
 
+@app.post("/api/plans/{plan_id}/preflight")
+def preflight_plan(plan_id: int, db: Session = Depends(get_db)):
+    """Preferred name for the read-only readiness check.
+
+    A preflight is backed by the immutable run timeline for this release; the
+    next schema phase can expose reports without changing callers again.
+    """
+    if not db.get(ReservationPlan, plan_id):
+        raise HTTPException(404, "计划不存在")
+    run_id = enqueue_plan(plan_id, "preflight", probe_only=True)
+    return {"accepted": True, "mode": "preflight", "report_id": run_id, "run_id": run_id}
+
+
 @app.post("/api/plans/{plan_id}/discover")
 def discover_plan_context(plan_id: int, db: Session = Depends(get_db)):
     """Run the read-only target-date discovery check without submitting."""
@@ -476,7 +491,8 @@ def _utc_iso(value):
     return value.replace(tzinfo=__import__("datetime").timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _run_json(run: ReservationRun) -> dict:
+def _run_json(run: ReservationRun, db: Session) -> dict:
+    events = list(run_events(run.id, db) if run.id else [])
     return {
         "id": run.id,
         "plan_id": run.plan_id,
@@ -495,8 +511,34 @@ def _run_json(run: ReservationRun) -> dict:
         "probe_results": run.probe_results,
         "parameter_source": run.parameter_source,
         "attempt_details": run.attempt_details,
+        "stage": run.stage,
+        "scheduled_for": _utc_iso(run.scheduled_for),
+        "wake_at": _utc_iso(run.wake_at),
+        "clock_offset_ms": run.clock_offset_ms,
+        "verified_reservation_id": run.verified_reservation_id,
+        "verified_status": run.verified_status,
+        "timeline": events,
         "started_at": _utc_iso(run.started_at),
         "finished_at": _utc_iso(run.finished_at),
+    }
+
+
+def run_events(run_id: int, db: Session) -> list[dict]:
+    return [
+        {"sequence": event.sequence, "stage": event.stage, "code": event.code, "message": event.message, "created_at": _utc_iso(event.created_at)}
+        for event in db.scalars(select(ReservationRunEvent).where(ReservationRunEvent.run_id == run_id).order_by(ReservationRunEvent.sequence))
+    ]
+
+
+@app.get("/api/scheduler/status")
+def scheduler_status():
+    return {
+        "running": scheduler.running,
+        "server_clock": clock.status(),
+        "jobs": [
+            {"id": job.id, "next_wake_at": str(job.next_run_time) if job.next_run_time else None}
+            for job in scheduler.get_jobs() if job.id.startswith("plan-")
+        ],
     }
 
 
@@ -505,9 +547,9 @@ def get_run(run_id: int, db: Session = Depends(get_db)):
     run = db.get(ReservationRun, run_id)
     if not run:
         raise HTTPException(404, "运行记录不存在")
-    return _run_json(run)
+    return _run_json(run, db)
 
 
 @app.get("/api/runs")
 def runs(db: Session = Depends(get_db)):
-    return [_run_json(run) for run in db.scalars(select(ReservationRun).order_by(desc(ReservationRun.id)).limit(100))]
+    return [_run_json(run, db) for run in db.scalars(select(ReservationRun).order_by(desc(ReservationRun.id)).limit(100))]

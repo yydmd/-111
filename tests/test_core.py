@@ -184,12 +184,11 @@ def _make_plan(session_factory, account_id=1, seats=("001", "002", "003"), max_a
     return plan_id
 
 
-def test_candidate_seats_round_robin_with_one_global_budget(tmp_path, monkeypatch):
+def test_candidate_seats_are_submitted_once_in_priority_order(tmp_path, monkeypatch):
     import app.service as service
 
     factory = _test_session_factory(tmp_path)
-    # The plan asks for 5 rounds; the safety policy clamps it to 3 and the
-    # candidate list still wraps around.
+    # A legacy high retry count cannot make a candidate submit twice.
     plan_id = _make_plan(factory, seats=("001", "002"), max_attempts=5)
     calls = []
 
@@ -203,15 +202,13 @@ def test_candidate_seats_round_robin_with_one_global_budget(tmp_path, monkeypatc
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
-    monkeypatch.setattr(service, "_wait_between_attempts", lambda _: None)
     monkeypatch.setattr(service, "_wait_first_pass", lambda _: None)
     execute_plan(plan_id)
-    assert calls == ["001", "002", "001"]
+    assert calls == ["001", "002"]
     db = factory()
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     assert run.status == "FAILED"
     assert run.error_code == "SEAT_UNAVAILABLE"
-    assert "钳制为 3" in run.message
     db.close()
 
 
@@ -260,6 +257,7 @@ def test_only_exact_recent_success_is_skipped(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "_verify_submission_with_poll", lambda *_: ({"id": "test"}, ""))
     service.execute_plan(plan_id)
     service.execute_plan(plan_id)
     assert calls == ["submit"]
@@ -284,6 +282,7 @@ def test_old_or_legacy_success_requires_confirmation_not_a_permanent_block(tmp_p
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "_verify_submission_with_poll", lambda *_: ({"id": "test"}, ""))
     db = factory()
     db.add(ReservationRun(account_id=1, target_date=(service.now_shanghai().date() + timedelta(days=1)).isoformat(), trigger="manual", status="SUCCESS", message="legacy"))
     db.commit()
@@ -326,6 +325,7 @@ def test_successful_probe_never_blocks_a_real_reservation(tmp_path, monkeypatch)
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "_verify_submission_with_poll", lambda *_: ({"id": "test"}, ""))
     service.execute_plan(plan_id, trigger="probe", probe_only=True)
     service.execute_plan(plan_id)
     assert calls == ["submit"]
@@ -597,7 +597,7 @@ def test_probe_with_select_params_checks_target_day_once_and_reports_each_seat(t
     db.close()
 
 
-def test_submit_rounds_are_clamped_to_three_and_select_params_are_passed(tmp_path, monkeypatch):
+def test_candidates_submit_once_and_select_params_are_passed(tmp_path, monkeypatch):
     import app.service as service
 
     factory = _test_session_factory(tmp_path)
@@ -619,16 +619,14 @@ def test_submit_rounds_are_clamped_to_three_and_select_params_are_passed(tmp_pat
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
-    monkeypatch.setattr(service, "_wait_between_attempts", lambda _: None)
     monkeypatch.setattr(service, "_wait_first_pass", lambda _: None)
     service.execute_plan(plan_id)
-    assert [seat for seat, _ in submits] == ["001", "002", "001"]
+    assert [seat for seat, _ in submits] == ["001", "002"]
     assert all(params == {"deptIdEnc": "ABC"} for _, params in submits)
     db = factory()
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     assert (run.status, run.error_code) == ("FAILED", "SEAT_UNAVAILABLE")
-    assert "钳制为 3" in run.message
-    assert len(run.attempt_details) == 3
+    assert len(run.attempt_details) == 2
     db.close()
 
 
@@ -666,7 +664,7 @@ def test_v5_database_migrates_context_and_attempt_audit_columns(tmp_path, monkey
     monkeypatch.setattr(db_module, "DATA_DIR", tmp_path)
     db_module._migrate_database()
     connection = sqlite3.connect(database_path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
     plan_columns = {row[1] for row in connection.execute("PRAGMA table_info(reservation_plans)")}
     run_columns = {row[1] for row in connection.execute("PRAGMA table_info(reservation_runs)")}
     assert {"select_context_source", "select_context_path", "select_context_checked_at"} <= plan_columns
@@ -695,7 +693,7 @@ def test_migration_v8_normalizes_legacy_absolute_context_path(tmp_path, monkeypa
     monkeypatch.setattr(db_module, "DATA_DIR", tmp_path)
     db_module._migrate_database()
     connection = sqlite3.connect(database_path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
     assert connection.execute("SELECT select_context_path FROM reservation_plans WHERE id=1").fetchone()[0] == "/front/third/apps/seat/select"
     connection.close()
 
@@ -813,6 +811,7 @@ def test_queued_run_uses_immutable_request_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "_verify_submission_with_poll", lambda *_: ({"id": "test"}, ""))
     service.execute_plan(plan_id, run_id=run_id)
     db = factory()
     saved = db.get(ReservationRun, run_id)
@@ -842,11 +841,12 @@ def test_manual_run_is_not_blocked_by_schedule_weekday(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "_verify_submission_with_poll", lambda *_: ({"id": "test"}, ""))
     service.execute_plan(plan_id, trigger="manual")
     assert calls == [True]
 
 
-def test_startup_catchup_enqueues_once_for_a_recently_missed_schedule(tmp_path, monkeypatch):
+def test_startup_records_missed_schedule_without_enqueuing_a_late_submit(tmp_path, monkeypatch):
     import app.scheduler as scheduler_module
 
     factory = _test_session_factory(tmp_path)
@@ -857,15 +857,13 @@ def test_startup_catchup_enqueues_once_for_a_recently_missed_schedule(tmp_path, 
     plan.weekdays_json = json.dumps(["Monday"])
     db.commit()
     db.close()
-    queued = []
     monkeypatch.setattr(scheduler_module, "SessionLocal", factory)
-    monkeypatch.setattr(scheduler_module, "enqueue_plan", lambda plan_id, trigger: queued.append((plan_id, trigger)) or 1)
     now = datetime(2026, 9, 7, 8, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
     assert scheduler_module._enqueue_recently_missed_jobs(now) == 1
-    assert queued == [(plan_id, "scheduled_catchup")]
     db = factory()
-    db.add(ReservationRun(plan_id=plan_id, target_date="2026-09-08", trigger="scheduled", status="SUCCESS", message="done"))
-    db.commit()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    assert run.status == "MISSED"
+    assert run.error_code == "MISSED_OPENING_WINDOW"
     db.close()
     assert scheduler_module._enqueue_recently_missed_jobs(now) == 0
 
@@ -965,6 +963,7 @@ def test_duplicate_with_server_side_reservation_skips_without_submitting(tmp_pat
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "_verify_submission_with_poll", lambda *_: ({"id": "test"}, ""))
     service.execute_plan(plan_id)
     assert submits == [True]
     db = factory()
@@ -997,6 +996,7 @@ def test_duplicate_absent_on_server_proceeds_with_reservation(tmp_path, monkeypa
     monkeypatch.setattr(service, "SessionLocal", factory)
     monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
     monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "_verify_submission_with_poll", lambda *_: ({"id": "test"}, ""))
     service.execute_plan(plan_id)
     assert submits == [True]
     db = factory()
@@ -1102,30 +1102,9 @@ def test_notify_settings_roundtrip_and_disabled_dispatch(tmp_path, monkeypatch):
     assert notify.send("t", "b") == "未配置通知渠道"
 
 
-def test_legacy_debug_loads_its_runtime_in_non_action_mode(monkeypatch):
+def test_local_main_does_not_expose_legacy_submit_entrypoint():
     import main
 
-    calls = []
-
-    class FakeReserve:
-        def __init__(self, **kwargs):
-            calls.append(("init", kwargs))
-            self.requests = type("Requests", (), {"headers": {}})()
-
-        def get_login_status(self):
-            calls.append(("status",))
-
-        def login(self, username, password):
-            calls.append(("login", username, password))
-
-        def submit(self, times, room_id, seats, action):
-            calls.append(("submit", times, room_id, seats, action))
-            return True
-
-    monkeypatch.setattr(main, "_legacy_runtime", lambda: (FakeReserve, lambda _action: ("", "")))
-    monkeypatch.setattr(main, "get_current_dayofweek", lambda _action: "Monday")
-    main.debug(
-        [{"username": "u", "password": "p", "time": ["08:00", "09:00"], "roomid": "100", "seatid": "001", "daysofweek": ["Monday"]}],
-        action=False,
-    )
-    assert ("submit", ["08:00", "09:00"], "100", ["001"], False) in calls
+    assert callable(main.main)
+    assert not hasattr(main, "debug")
+    assert not hasattr(main, "login_and_reserve")

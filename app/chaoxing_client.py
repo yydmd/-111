@@ -515,6 +515,42 @@ class ChaoxingClient:
         detail = "、".join(dict.fromkeys(context_errors)) or current_result.page_state
         raise ReservationError("TARGET_CONTEXT_UNAVAILABLE", f"未取得目标日期预约参数（当前状态仅供参考；检查结果：{detail}）")
 
+    def resolve_target_day_with_retry(
+        self,
+        room_id: str,
+        seat_num: str,
+        day: dt.date,
+        select_params: dict[str, str] | None = None,
+        select_path: str | None = None,
+        select_source: str | None = None,
+    ) -> ProbeResult:
+        """Fetch an ephemeral target-day token only during the opening window.
+
+        The platform intentionally serves an internal error page shortly before
+        opening.  Retrying the read-only GET for five seconds avoids converting
+        that expected state into a false TOKEN_MISSING error, while never
+        falling back to a current-day token for a real submission.
+        """
+        schedule = (0.0, 0.10, 0.25, 0.50, 0.90, 1.40, 2.10, 3.00, 4.00, 5.00)
+        started = time.monotonic()
+        last_error: ReservationError | None = None
+        for offset in schedule:
+            remaining = started + offset - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            try:
+                return self.resolve_submission_page(
+                    room_id, seat_num, day, select_params, select_path, select_source,
+                    require_target_day=True,
+                )
+            except ReservationError as exc:
+                last_error = exc
+                if exc.code not in {"TARGET_DAY_NOT_OPEN", "TARGET_CONTEXT_UNAVAILABLE"}:
+                    raise
+        if last_error:
+            raise last_error
+        raise ReservationError("TARGET_CONTEXT_UNAVAILABLE", "未取得目标日期预约参数")
+
     def fetch_reservations(self, select_params: dict[str, str] | None = None, select_path: str | None = None) -> list[dict]:
         """Read-only: list the account's current/upcoming seat reservations.
 
@@ -658,7 +694,7 @@ class ChaoxingClient:
             # pre-warm gate; reuse them so only the final POST remains.
             probe = pre_resolved
         else:
-            probe = self.resolve_submission_page(room_id, seat_num, day, select_params, select_path, select_source)
+            probe = self.resolve_target_day_with_retry(room_id, seat_num, day, select_params, select_path, select_source)
         captcha = ""
         if probe.captcha_type in CAPTCHA_TYPES:
             # Automatic captcha solving is intentionally disabled in the local

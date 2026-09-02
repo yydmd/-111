@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 # A short wake-up delay should not throw away an opening-window reservation, but
 # we still refuse to replay stale work much later.
 scheduler = BackgroundScheduler(timezone=ZoneInfo("Asia/Shanghai"), job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 15})
-STARTUP_CATCHUP_SECONDS = 90
+# A restart shortly after opening must be visible, but must not submit late.
+STARTUP_MISSED_WINDOW_SECONDS = 90
 # Scheduled plans wake up this many seconds before their run time so login and
 # page warm-up finish before the platform's opening moment; the submit itself
 # still waits for the (server-aligned) run time inside the run.
@@ -58,7 +59,7 @@ def refresh_jobs() -> None:
 def start_scheduler() -> None:
     if not scheduler.running:
         refresh_jobs()
-        _enqueue_recently_missed_jobs()
+        _record_recently_missed_jobs()
         scheduler.start()
 
 
@@ -67,18 +68,13 @@ def stop_scheduler() -> None:
         scheduler.shutdown(wait=False)
 
 
-def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
-    """Queue one just-missed opening-window run after a service restart.
-
-    APScheduler jobs are in memory. A new scheduler created seconds after the
-    planned minute otherwise schedules the *next day* and silently loses today.
-    The durable run table prevents a duplicate catch-up.
-    """
+def _record_recently_missed_jobs(now: dt.datetime | None = None) -> int:
+    """Persist a missed opening window after restart without late submission."""
     current = now or dt.datetime.now(ZoneInfo("Asia/Shanghai"))
     if current.tzinfo is None:
         current = current.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
     db = SessionLocal()
-    plan_ids: list[int] = []
+    plans: list[ReservationPlan] = []
     try:
         statement = select(ReservationPlan).join(Account).where(ReservationPlan.enabled.is_(True), Account.enabled.is_(True))
         for plan in db.scalars(statement):
@@ -90,7 +86,7 @@ def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
             except ValueError:
                 continue
             delay = (current - scheduled_at).total_seconds()
-            if not 0 < delay <= STARTUP_CATCHUP_SECONDS:
+            if not 0 < delay <= STARTUP_MISSED_WINDOW_SECONDS:
                 continue
             target_date = (current.date() + dt.timedelta(days=plan.day_offset)).isoformat()
             already_created = db.scalar(
@@ -101,11 +97,23 @@ def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
                 ).limit(1)
             )
             if not already_created:
-                plan_ids.append(plan.id)
+                plans.append(plan)
+        for plan in plans:
+            db.add(ReservationRun(
+                plan_id=plan.id, account_id=plan.account_id, plan_name=plan.name,
+                account_name=plan.account.name, target_date=(current.date() + dt.timedelta(days=plan.day_offset)).isoformat(),
+                trigger="scheduled", status="MISSED", stage="MISSED", error_code="MISSED_OPENING_WINDOW",
+                message="服务在开放时间后启动；系统按安全策略未进行补抢", started_at=current.astimezone(dt.UTC).replace(tzinfo=None),
+                finished_at=current.astimezone(dt.UTC).replace(tzinfo=None),
+            ))
+        db.commit()
     finally:
         db.close()
-    for plan_id in plan_ids:
-        enqueue_plan(plan_id, "scheduled_catchup")
-    if plan_ids:
-        logger.warning("Queued %s recently missed reservation job(s) after service startup", len(plan_ids))
-    return len(plan_ids)
+    if plans:
+        logger.warning("Recorded %s missed opening-window job(s) after service startup", len(plans))
+    return len(plans)
+
+
+# Kept as a non-submitting compatibility alias for local integrations.
+def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
+    return _record_recently_missed_jobs(now)
