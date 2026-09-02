@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
+import logging
 import os
 import secrets
 import subprocess
@@ -11,17 +13,19 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from .chaoxing_client import EPHEMERAL_SELECT_KEYS, normalize_select_context_path, parse_select_context_url
 from . import clock, notify
 from .db import Account, PlanSeat, ReservationPlan, ReservationRun, get_db, init_db
-from .scheduler import refresh_jobs, scheduler, start_scheduler, stop_scheduler
+from .scheduler import LEAD_SECONDS, _enqueue_recently_missed_jobs, refresh_jobs, scheduler, start_scheduler, stop_scheduler
 from .security import encrypt_password
 from .service import active_run_count, enqueue_plan, recover_interrupted_runs
 from .validation import normalize_time, validate_reservation_time_range
+
+logger = logging.getLogger(__name__)
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 CSRF_TOKEN = secrets.token_urlsafe(24)
@@ -203,6 +207,13 @@ class PlanData(BaseModel):
     @model_validator(mode="after")
     def validate_time_range(self) -> "PlanData":
         validate_reservation_time_range(self.start_time, self.end_time)
+        run_hour, run_minute = map(int, self.run_time.split(":", 1))
+        if run_hour == 0 and run_minute < 30:
+            # The scheduler wakes LEAD_SECONDS (30s) before run_time and clamps
+            # a wake-up that would cross midnight to 00:00:00; a run_time in
+            # 00:00–00:29 then wakes up to half an hour early and burns the
+            # 60-second run limit long before the opening moment.
+            raise ValueError("暂不支持 00:00–00:29 的执行时间（跨日提前唤醒会超出单次任务 60 秒运行上限）；请选择 00:30 及以后的时间")
         if len(self.seats) > self.max_attempts:
             raise ValueError("候选座位数不能超过总尝试次数；这样每个候选都能至少尝试一次")
         bound_room = str((self.select_params or {}).get("id", "")).strip()
@@ -212,15 +223,60 @@ class PlanData(BaseModel):
 
 
 class PlanPatch(PlanData):
-    pass
+    """Historical request-model name kept for older local integrations.
+
+    The PATCH endpoint itself now accepts a partial JSON object and validates
+    the MERGED result as full PlanData, so ``{"enabled": false}`` is a legal
+    patch and never wipes fields the request did not carry.
+    """
 
 
 # Backward-compatible import name used by earlier local tests and integrations.
 PlanIn = PlanData
 
 
+def _plan_payload_from(plan: ReservationPlan) -> dict:
+    """The plan as a full PlanData-shaped payload (base for PATCH merges)."""
+    return {
+        "account_id": plan.account_id,
+        "name": plan.name,
+        "room_id": plan.room_id,
+        "seats": [seat.seat_num for seat in plan.seats],
+        "start_time": plan.start_time,
+        "end_time": plan.end_time,
+        "run_time": plan.run_time,
+        "day_offset": plan.day_offset,
+        "weekdays": plan.weekdays,
+        "slider_enabled": plan.slider_enabled,
+        "max_attempts": plan.max_attempts,
+        "enabled": plan.enabled,
+        "select_params": plan.select_params,
+        "select_context_path": plan.select_context_path,
+        "select_context_source": plan.select_context_source,
+    }
+
+
 def _account_json(account: Account) -> dict:
     return {"id": account.id, "name": account.name, "username": account.username, "enabled": account.enabled}
+
+
+def _next_run_at(plan: ReservationPlan) -> str | None:
+    """The next real fire moment per the LIVE scheduler.
+
+    The cron job wakes LEAD_SECONDS before run_time, so the reservation's own
+    moment is the job's next fire time plus the lead. A browser-side guess
+    once kept promising an execution the scheduler had already moved to
+    tomorrow (2026-09-03 incident); the UI now prefers this server value.
+    """
+    if not plan.enabled or not scheduler.running:
+        return None
+    try:
+        job = scheduler.get_job(f"plan-{plan.id}")
+    except Exception:
+        return None
+    if job is None or job.next_run_time is None:
+        return None
+    return (job.next_run_time + dt.timedelta(seconds=LEAD_SECONDS)).isoformat()
 
 
 def _plan_json(plan: ReservationPlan) -> dict:
@@ -240,6 +296,7 @@ def _plan_json(plan: ReservationPlan) -> dict:
         "enabled": plan.enabled,
         "select_params": plan.select_params,
         "context_status": "ready" if plan.select_params else "not_checked",
+        "next_run_at": _next_run_at(plan),
         # Request and response use the same canonical names.  Keep the old
         # aliases temporarily for older local browser tabs.
         "select_context_source": plan.select_context_source,
@@ -251,7 +308,21 @@ def _plan_json(plan: ReservationPlan) -> dict:
     }
 
 
-def _apply_plan_data(plan: ReservationPlan, data: PlanData) -> None:
+_SELECT_CONTEXT_FIELDS = ("select_params", "select_context_path", "select_context_source")
+
+
+def _apply_plan_data(plan: ReservationPlan, data: PlanData, provided: set[str] | None = None) -> None:
+    """Apply validated plan data; ``provided`` enables PATCH partial updates.
+
+    A full save (POST, or the edit form) supplies every field. A partial PATCH
+    — the enable/disable toggle sends only ``{"enabled": true}`` — must NOT
+    touch fields it did not carry: the toggle once wiped a discovered select
+    context because the browser PATCHed a stale full snapshot with
+    ``select_params: null`` (2026-09-03 audit). The select-context trio is
+    therefore only written when the request actually carries it.
+    """
+    full_replace = provided is None
+    old_context = (plan.select_params_json, plan.select_context_path, plan.select_context_source)
     plan.account_id = data.account_id
     plan.name = data.name.strip()
     plan.room_id = data.room_id.strip()
@@ -263,12 +334,30 @@ def _apply_plan_data(plan: ReservationPlan, data: PlanData) -> None:
     plan.slider_enabled = data.slider_enabled
     plan.max_attempts = data.max_attempts
     plan.enabled = data.enabled
-    plan.select_params_json = json.dumps(data.select_params, ensure_ascii=False) if data.select_params else None
-    plan.select_context_path = data.select_context_path if data.select_params else None
-    plan.select_context_source = (data.select_context_source or "advanced_manual") if data.select_params else None
-    plan.select_context_checked_at = None
+    if full_replace or any(field in provided for field in _SELECT_CONTEXT_FIELDS):
+        plan.select_params_json = json.dumps(data.select_params, ensure_ascii=False) if data.select_params else None
+        plan.select_context_path = data.select_context_path if data.select_params else None
+        plan.select_context_source = (data.select_context_source or "advanced_manual") if data.select_params else None
+    if (plan.select_params_json, plan.select_context_path, plan.select_context_source) != old_context:
+        # Only a genuinely changed context invalidates the "checked at" stamp;
+        # a bare toggle must not erase audit information.
+        plan.select_context_checked_at = None
     plan.seats.clear()
     plan.seats.extend(PlanSeat(seat_num=seat, priority=index) for index, seat in enumerate(data.seats))
+
+
+def _refresh_jobs_and_catch_up() -> None:
+    """Refresh cron jobs, then catch a run whose fire moment just passed.
+
+    A plan saved after its (run_time - 30s) wake-up moment would otherwise be
+    silently scheduled for tomorrow; apply the same recently-missed catch-up
+    the service uses at startup (dedup lives in the durable run table).
+    """
+    refresh_jobs()
+    try:
+        _enqueue_recently_missed_jobs()
+    except Exception:
+        logger.warning("post-save catch-up check failed", exc_info=True)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -389,21 +478,35 @@ def create_plan(data: PlanData, db: Session = Depends(get_db)):
     db.add(plan)
     db.commit()
     db.refresh(plan)
-    refresh_jobs()
+    _refresh_jobs_and_catch_up()
     return _plan_json(plan)
 
 
 @app.patch("/api/plans/{plan_id}")
-def patch_plan(plan_id: int, data: PlanPatch, db: Session = Depends(get_db)):
+def patch_plan(plan_id: int, payload: dict, db: Session = Depends(get_db)):
+    """Partial update: merge the carried fields onto the stored plan.
+
+    The whole merged document is validated as full PlanData (range checks,
+    seat/attempt coupling, select-context↔room binding), so a partial patch
+    can never produce an inconsistent plan — but untouched fields, crucially
+    the discovered select context, keep their persisted values.
+    """
     plan = db.get(ReservationPlan, plan_id)
     if not plan:
         raise HTTPException(404, "计划不存在")
+    if not isinstance(payload, dict) or not payload:
+        raise HTTPException(422, "PATCH 请求体必须是非空 JSON 对象")
+    merged = {**_plan_payload_from(plan), **payload}
+    try:
+        data = PlanData(**merged)
+    except ValidationError as exc:
+        raise HTTPException(422, "；".join(filter(None, (str(error.get("msg") or "") for error in exc.errors())))) from exc
     if not db.get(Account, data.account_id):
         raise HTTPException(404, "账号不存在")
-    _apply_plan_data(plan, data)
+    _apply_plan_data(plan, data, provided=set(payload.keys()))
     db.commit()
     db.refresh(plan)
-    refresh_jobs()
+    _refresh_jobs_and_catch_up()
     return _plan_json(plan)
 
 
@@ -418,18 +521,39 @@ def delete_plan(plan_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+def _reject_if_account_busy(db: Session, plan: ReservationPlan) -> None:
+    """Refuse a second concurrent run for the same account up front.
+
+    The executor's account lock already serialises real submissions; this
+    check keeps a double-clicked probe/run from queueing a whole extra
+    login+submit cycle (risk-control exposure) behind the first one.
+    """
+    active = db.scalar(
+        select(ReservationRun.id).where(
+            ReservationRun.account_id == plan.account_id,
+            ReservationRun.status.in_(("PENDING", "RUNNING")),
+        ).limit(1)
+    )
+    if active:
+        raise HTTPException(409, "该账号已有任务在排队或执行中，请等待完成后再试")
+
+
 @app.post("/api/plans/{plan_id}/probe")
 def probe_plan(plan_id: int, db: Session = Depends(get_db)):
-    if not db.get(ReservationPlan, plan_id):
+    plan = db.get(ReservationPlan, plan_id)
+    if not plan:
         raise HTTPException(404, "计划不存在")
+    _reject_if_account_busy(db, plan)
     return {"accepted": True, "mode": "probe", "run_id": enqueue_plan(plan_id, "probe", probe_only=True)}
 
 
 @app.post("/api/plans/{plan_id}/discover")
 def discover_plan_context(plan_id: int, db: Session = Depends(get_db)):
     """Run the read-only target-date discovery check without submitting."""
-    if not db.get(ReservationPlan, plan_id):
+    plan = db.get(ReservationPlan, plan_id)
+    if not plan:
         raise HTTPException(404, "计划不存在")
+    _reject_if_account_busy(db, plan)
     return {"accepted": True, "mode": "discover", "run_id": enqueue_plan(plan_id, "discover", probe_only=True)}
 
 
@@ -449,8 +573,10 @@ def parse_select_link(data: SelectUrlIn):
 
 @app.post("/api/plans/{plan_id}/run")
 def run_plan(plan_id: int, db: Session = Depends(get_db)):
-    if not db.get(ReservationPlan, plan_id):
+    plan = db.get(ReservationPlan, plan_id)
+    if not plan:
         raise HTTPException(404, "计划不存在")
+    _reject_if_account_busy(db, plan)
     return {"accepted": True, "mode": "reserve", "run_id": enqueue_plan(plan_id, "manual", probe_only=False)}
 
 

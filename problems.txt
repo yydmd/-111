@@ -1,0 +1,90 @@
+# 问题记录
+
+## 2026-09-03 全面排查：17 项修复（含 01:29 定时计划未执行事故）
+
+- **事故记录**：计划 6（房间 10713，座位 097→098→099→100，21:00-21:30）run_time 改为 01:29 并于 01:28:35 保存（目标日 2026-09-04，auto_context 已保存）。到点后**计划未执行**——无唤醒日志、无运行记录；界面仍显示"下次自动执行 2026-09-03 01:29"。
+- **根本原因（scheduler.py:96-104，经日志 + app.db 实证）**：01:28:35 保存时新 run_time 的唤醒时刻（01:28:30）已过 5 秒，APScheduler 把 cron 排到明天；唯一兜底的"错过后补跑"被 `already_created` 去重查询静默吞掉——该查询只按 `(plan_id, target_date, trigger∈scheduled*)` 匹配，命中了当天 01:01 旧 run_time 产生的 FAILED 记录（run #221，同目标日 2026-09-04）。day_offset=1 使同日不同 run_time 的执行共享 target_date，去重键却不含运行日期与状态。
+- **修复**：去重仅认可 **PENDING/RUNNING（在途）或 SUCCESS（已订上）** 的 run；FAILED 等失败终态意味着窗口已丢失，正是补跑要救的场景；真实重复预约仍由 SUCCESS 指纹查重 + 超星端核实两层安全网拦截。回归测试见 `test_catchup_after_failed_run_still_enqueues`。
+
+### 本轮修复清单（三路代码审查 + 实证定位）
+
+**P0（01:29 事故）**
+1. `app/scheduler.py` 补跑去重加状态过滤（上述根因）。
+2. `/api/plans` 新增后端 `next_run_at`（取自 APScheduler 任务的真实下次触发 + 30s 提前量），前端"下次自动执行"优先显示后端值，浏览器推算仅作后备——事故中正是纯前端推算掩盖了"已排到明天"的事实（smoke 实证：plan 6 现如实显示 2026-09-04 01:29）。
+
+**P1（高危，直接影响抢座成功率）**
+3. `app/service.py` 串行重试不再复用旧 `pre_resolved`：原 `pre_resolved = None` 只在成功路径执行，单座位 303 后的重试把被拒 token 原样再提交（上一事故根因"token 太旧"的单座位残留路径）。现改为提交前无条件消费。
+4. 串行兜底轮换候选座位：整队 303 后刷新重试依次轮到 098/099，不再把预算全砸在 097（`round_tried` 轮换，dead_seats 绝不重试的不变量不变）。
+5. `app/clock.py` 校准加耗时预算（dense 8s/普通 4s），探测循环超预算即用现有样本结算——读超时黑洞下原来最坏可烧 ~96s，超出 60s 运行预算且吞掉 30s 提前量。
+6. run_time 00:00–00:29 保存时 422 拒绝（跨日钳制会提前唤醒长达半小时，必然超时）；`_poll_until_open` 循环加 deadline 检查作纵深防御，racer 收尾改为"先 stop 后唤醒"避免越过停止检查提交。
+7. `app/web.py` PATCH 改为部分更新：合并到现有计划后整体校验；"停用/启用"只发 `{enabled}`，不再用陈旧缓存全量覆盖——原行为会静默清空已发现的选座参数（auto_context）。`select_context_checked_at` 仅在参数实际变化时重置。
+
+**P2（中危）**
+8. 未识别的 30x 重定向从 `BLOCKED_BY_RISK`（终局风控、volley 直接 fatal、账号标记风控）降级为可重试 `HTTP_REDIRECT`。
+9. `submit_once` 限流措辞（"频繁"/"请稍后再试"）归类可重试 `RATE_LIMITED`（退避重试）而非风控；303 短语补充"请刷新后重试/请刷新页面"等变体。
+10. `_poll_until_open` 缓存页附时间戳：fire 时刻页面过旧（>1s）先再取一次，失败才回退旧页（与 #3 叠加防 303）。
+11. 前端 `escapeHtml` 补引号转义（`title="..."` 属性注入面）；保存按钮防双击（禁用中不可重复提交，避免创建重复计划）；`waitForRun` 查询出错时也恢复按钮（原来会永久禁用）。
+12. `misfire_grace_time` 15→90（与补跑窗口对齐，CPU 饱和导致的 >15s 调度延迟不再静默丢任务）。
+13. `app/db.py` SQLite 连接加 `journal_mode=WAL` + `busy_timeout=5000`（多线程频繁提交运行状态不再被写锁打断；`finally: db.commit()` 抛错会吞掉真实运行结果）。
+14. probe/discover/run 端点同账号已有 PENDING/RUNNING 任务时返回 409（防双击排队整轮登录+提交，减少风控暴露）。
+15. `app/clock.py` 模块级 Session 改线程本地（requests.Session 非线程安全，多计划同秒唤醒时 cookie jar 有竞态）。
+
+### 验证
+
+- `tests/test_core.py` 83/83 通过（原 72 + 新增 11：补跑去重、PATCH 保参数、run_time 校验、座位轮换、单座位刷新重试、限流/303 变体分类、poller deadline、fire 时刻旧页再取、clock 预算、账号忙 409、next_run_at 读真实调度器）。
+- `tests/upgrade_check.py` 38/38 通过（新增 5 个场景：clock 预算、失败后补跑、串行轮换、PATCH 保参数、重定向/限流可重试）。
+- Web smoke（8788 端口临时实例）：/health 200；/api/plans 返回调度器真实的 next_run_at（plan 6 = 2026-09-04 01:29，如实反映"已排明天"）；PATCH 不存在计划 404；run_time 00:10 创建被 422 拒绝并说明原因。
+- 上一事故 4 项修复不变量经 83 个测试全量回归确认未被破坏（TOKEN_STALE 不计预算 / racer 先对齐再取页 / 松弛刷新 / 终局如实报告）。
+
+### 已知未修问题（本轮记录在案，后续处理）
+
+- deadline 临界 racer 迟到 ~1s 的 POST 落地后不在审计中、也不触发服务器核实（chaoxing_client 超时下限 1s 与 join 截止的缝隙）。
+- `logged_in` 一次性闩锁：开抢途中 LOGIN_REQUIRED 无自动重登路径；克隆会话 cookie 是快照，可能与父会话分叉。
+- `_parse_page` 用整页全文匹配 `passport2.chaoxing.com` 判登录失效，页面模板含该字样即误报。
+- racer 兜底会跨会话复用 poller 页面 token，多 racer 同时提交字节级相同 token。
+- `submit_enc` 多输入时"最后者胜"（legacy 取第一个）；token 正则无词边界可能匹配 `captchaToken` 等。
+- 登录凭据走 URL 查询串（沿袭 upstream）；登录失败不区分验证码/锁定。
+- `clock` 拒绝异常偏差后仍刷新 `_measured_at`（坏数据锁定 10 分钟）；`security.redact` 的裸 `enc` 子串会过度改写。
+- 预算读活 plan 而非快照（30s 提前唤醒窗口内改计划会影响在跑任务）；racer 线程只捕获 ReservationError，其余异常静默无 outcome。
+- 服务停机超过 90s 后恢复的当天计划静默丢失（补跑窗口外）；`shutdown(wait=False)` 可能让停机瞬间入队的 run 滞留 PENDING。
+- `_solve_slider` 是死代码（UI 开关无效承诺）；legacy `utils/reserve.py` 请求无超时，接线前必须先补。
+- 前端 planCache 仅在 load() 刷新，多标签页 last-write-wins；runs 轮询不刷新 plans 区。
+
+### 涉及文件
+
+- `app/scheduler.py`、`app/service.py`、`app/chaoxing_client.py`、`app/clock.py`、`app/web.py`、`app/db.py`、`app/templates/index.html`
+- `tests/test_core.py`、`tests/upgrade_check.py`
+
+---
+
+## 2026-09-03 01:01 定时预约整队失败：TOKEN_STALE 耗尽重试预算（已修复）
+
+- **事故记录**：测试1 / 缪迪 · 定时预约，目标日 2026-09-04，候选座位 097 → 098 → 099 → 100（默认 max_attempts=3）。
+- **现象**：并行开抢 4 个座位全部失败——097/098/099 返回 `TOKEN_STALE`（平台 303："您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约"），100 返回 `SEAT_UNAVAILABLE`（该时间段已被占用）。运行记录终局显示"失败 / 座位不可预约"。
+
+### 根本原因（三个叠加缺陷，均在 app/service.py）
+
+1. **重试预算被 303 拒绝耗光（主因）**：并行 volley 的 4 次提交全部计入 `used_attempts`，而预算上限 `attempts = min(max(3, 4), 6) = 4`，串行兜底循环 `range(4, 4)` 为空——虽然 `TOKEN_STALE` 被归类为"可重试、需刷新页面"，但一次刷新重试都没有执行就终止了。
+2. **token 取得太早**：预约窗口已开放的时段（如本次 01:01 测试），poller 首跳即判定"已开"并唤醒 racer，racer 在开抢时刻前约 2 秒取页面参数，再等到点提交——token 在线上老化，被平台按 303 拒绝。
+3. **终局结论误导**：预算耗尽后取"最后一条结果"的错误码（座位 100 的 SEAT_UNAVAILABLE）作为整个运行的结论，掩盖了 3 个座位实际是可重试的 303 拒绝。
+
+### 修复方案（app/service.py）
+
+1. `used_attempts` 不再统计 `TOKEN_STALE` 拒绝：303 是平台明确的"已拒绝、请刷新后重提"，未预约成功任何东西，不应占用串行重试预算；整队 303 后串行刷新重试必定执行（已确认占用的座位仍绝不重试）。
+2. racer 改为先 `_hold_until_fire` 对齐开抢时刻、再取页面参数，提交所用 token 尽可能新；真开抢竞速场景时序不变（窗口只在时刻点后打开，两种顺序等价）。
+3. `_poll_until_open` 在窗口已可用且距开抢仍超过 0.3s 时，按松弛节奏（0.2s）持续刷新页面直到临近开抢，交给单座位路径 / racer 兜底的页面不再老化。
+4. 若刷新重试后仍全部 303，终局如实报告 `TOKEN_STALE` 而非误报"座位不可预约"。
+
+### 验证
+
+- `tests/test_core.py` 新增 2 个回归测试（复刻本次 4 座位全 303 + 1 占用场景：4 次并行 + 1 次串行刷新重试 → 成功；刷新仍 303 → 终局 TOKEN_STALE），全量 72/72 通过。
+- `tests/upgrade_check.py` 新增 `scenario_parallel_token_stale_recovery` / `scenario_stale_exhaustion_keeps_real_code` 两个场景，28/28 通过。
+
+### 涉及文件
+
+- `app/service.py`（核心修复：预算记账、racer 时序、poller 刷新）
+- `tests/test_core.py`、`tests/upgrade_check.py`（回归测试）
+
+### 备注
+
+- 平台 303 的错误分类（`TOKEN_STALE`，区别于风控拦截）由上一轮未提交的改动引入（`app/chaoxing_client.py`），本次修复建立在其上。

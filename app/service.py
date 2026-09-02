@@ -35,7 +35,14 @@ MAX_SUBMIT_ATTEMPTS = 6
 # worth trying instead of stopping the run. TARGET_*_UNCOVERABLE/NOT_OPEN are
 # what the platform answers in the milliseconds before the window really
 # switches, so an opening-moment shot must rotate/retry rather than die.
-_RETRYABLE_CODES = {"SEAT_UNAVAILABLE", "TARGET_CONTEXT_UNAVAILABLE", "TARGET_DAY_NOT_OPEN"}
+# TOKEN_STALE (platform error 303) is an explicit "refresh and resubmit"
+# rejection: the retry re-fetches the target-day page first — exactly what the
+# platform asks for — and the request was already refused, so retrying
+# carries no double-submit risk. HTTP_REDIRECT covers 30x hops the classifier
+# does not recognise (frequently a benign session/page jump, not risk
+# control); RATE_LIMITED is throttling ("操作频繁") — both retry after a
+# back-off instead of a fatal verdict.
+_RETRYABLE_CODES = {"SEAT_UNAVAILABLE", "TARGET_CONTEXT_UNAVAILABLE", "TARGET_DAY_NOT_OPEN", "TOKEN_STALE", "HTTP_REDIRECT", "RATE_LIMITED"}
 # Opening-window discipline, bot-race edition: the scheduler wakes LEAD
 # seconds early, login and browsing warm up, one poller re-fetches the
 # target-day page ever more densely through the opening moment (a single
@@ -52,6 +59,10 @@ OPENING_GRACE_SECONDS = 3.0
 FIRE_BUSY_STEP = 0.005
 FIRST_PASS_WAIT_RANGE = (0.05, 0.15)
 RETRY_WAIT_RANGE = (0.3, 0.6)
+# A cached opening page older than this at the fire moment gets one more
+# fetch before it is submitted: a page that aged through failed re-fetches is
+# exactly what the platform rejects with error 303 (TOKEN_STALE).
+STALE_PAGE_TOLERANCE_SECONDS = 1.0
 # How many candidate seats submit simultaneously at the opening moment. The
 # web UI caps a plan's candidate pool at the same number, so a full pool can
 # be covered by one all-at-once volley.
@@ -360,15 +371,23 @@ def _hold_until_fire(fire_epoch: float) -> None:
         time.sleep(min(remaining, FIRE_BUSY_STEP))
 
 
-def _poll_until_open(client: ChaoxingClient, fire_epoch: float, request_values: dict, target_day: dt.date) -> ProbeResult | None:
+def _poll_until_open(client: ChaoxingClient, fire_epoch: float, request_values: dict, target_day: dt.date, deadline: float) -> ProbeResult | None:
     """Re-fetch the target-day select page through the opening moment.
 
     Before the window opens the platform answers a perfectly valid request
     with its not-open error page, so one early fetch is worthless: the race is
     decided by whoever re-fetches within milliseconds of the switch. Poll with
     one cheap GET, relaxed early and dense only around the decisive moment.
-    Returns the first usable page, or None when the window never opened within
-    the grace period (the serial submit path then re-resolves on its own).
+    When the page is already usable seconds before the planned moment (a plan
+    tested outside the rush, or a school that opens early), keep refreshing at
+    the relaxed cadence — like a waiting human reloading the page — so the
+    parameters handed to the submit are fresh at the fire moment instead of
+    aging on the wire into a platform error 303 (TOKEN_STALE) rejection.
+    Returns the freshest usable page, or None when the window never opened
+    within the grace period (the serial submit path then re-resolves on its
+    own). Raises DEADLINE_EXCEEDED at ``deadline`` so a clamp-woken run (see
+    scheduler._fire_time_of_day) cannot spin for half an hour holding the
+    account lock.
     """
     # Wait quietly until the prefetch lead window begins.
     while True:
@@ -378,17 +397,41 @@ def _poll_until_open(client: ChaoxingClient, fire_epoch: float, request_values: 
         time.sleep(min(remaining - PREFETCH_LEAD_SECONDS, 0.2))
     context = request_values["select_params"] or {"id": request_values["room_id"].strip()}
     select_path = request_values["select_context_path"]
+    latest: ProbeResult | None = None
+    latest_at = 0.0
     while app_clock.server_now() <= fire_epoch + OPENING_GRACE_SECONDS:
+        if time.monotonic() >= deadline:
+            raise ReservationError("DEADLINE_EXCEEDED", "任务超过 60 秒运行上限")
+        remaining = fire_epoch - app_clock.server_now()
+        if latest is not None and remaining <= 0:
+            if time.monotonic() - latest_at <= STALE_PAGE_TOLERANCE_SECONDS:
+                # Fire moment reached with a fresh page in hand; the caller's
+                # own hold gate is the only remaining wait.
+                return latest
+            # The cached page aged (recent re-fetches failed); one more fetch
+            # right now is exactly the platform's own 303 remedy. Only fall
+            # back to the aged page when this last fetch also fails.
+            try:
+                fresh = client.fetch_target_day_page(target_day, dict(context), select_path)
+            except ReservationError:
+                fresh = None
+            if fresh is not None and (fresh.ok or fresh.captcha_type in CAPTCHA_TYPES):
+                return fresh
+            return latest
         try:
             result = client.fetch_target_day_page(target_day, dict(context), select_path)
         except ReservationError:
             result = None
         if result is not None and (result.ok or result.captcha_type in CAPTCHA_TYPES):
+            latest = result
+            latest_at = time.monotonic()
+            if remaining > DENSE_WINDOW_BEFORE_FIRE:
+                time.sleep(OPENING_POLL_RELAXED)
+                continue
             return result
-        remaining = fire_epoch - app_clock.server_now()
         interval = OPENING_POLL_DENSE if remaining <= DENSE_WINDOW_BEFORE_FIRE else OPENING_POLL_RELAXED
         time.sleep(interval)
-    return None
+    return latest
 
 
 def _await_fire_and_prefetch(
@@ -397,13 +440,14 @@ def _await_fire_and_prefetch(
     request_values: dict,
     target_day: dt.date,
     seat: str,
+    deadline: float,
 ):
     """Block until the window opens, then hand the caller a fresh page.
 
     Returns the resolved ProbeResult for the first submit, or None when the
     window did not open in time — the submit path then resolves itself.
     """
-    pre = _poll_until_open(client, fire_epoch, request_values, target_day)
+    pre = _poll_until_open(client, fire_epoch, request_values, target_day, deadline)
     if pre is None:
         return None
     # The window may have opened before the planned moment; never submit early.
@@ -464,6 +508,16 @@ def _parallel_opening_shot(
             return  # poller never saw the window; the serial fallback owns this
         if stop.is_set():
             return
+        # Align with the platform's clock FIRST, resolve the page second. In
+        # the true-race case the window only opens at/after the moment, so
+        # this is timing-identical. But when the window is already open (a
+        # plan tested outside the rush, or a school that opens early) the
+        # poller wakes us ~PREFETCH_LEAD_SECONDS early, and a token fetched
+        # that far before the submit is exactly what ChaoXing rejects with
+        # error 303 (页面停留过久/安全验证已超时).
+        _hold_until_fire(fire_epoch)
+        if stop.is_set():
+            return
         # 2) Shortest path: one GET on the poller-verified context. Only an
         #    unusable answer falls back to the full resolver chain.
         resolved = None
@@ -487,7 +541,6 @@ def _parallel_opening_shot(
             if page is None or not page.ok or page.captcha_type in CAPTCHA_TYPES:
                 return
             resolved = page
-        _hold_until_fire(fire_epoch)
         if stop.is_set():
             return
         try:
@@ -511,23 +564,32 @@ def _parallel_opening_shot(
                 winner = outcomes[-1]
                 stop.set()
 
+    # Referenced by race() as a last-resort page; defined before the threads
+    # start so no scheduling surprise can race the assignment.
+    pre_holder: dict = {"page": None}
     threads = [
-        threading.Thread(target=race, args=(seat, client.clone_authenticated()), name=f"opening-{seat}", daemon=True)
+        threading.Thread(target=race, args=(seat, client.clone_authenticated()), name=f"opening-{seat}")
         for seat in workers
     ]
     for thread in threads:
         thread.start()
 
     # 3) The single dense poller watches for the window; racers hold until it
-    #    fires (or the window never opens and the serial fallback takes over).
-    pre = _poll_until_open(client, fire_epoch, request_values, target_day)
-    pre_holder: dict = {"page": None}
+    # fires (or the window never opens and the serial fallback takes over).
+    pre = None
+    try:
+        pre = _poll_until_open(client, fire_epoch, request_values, target_day, deadline)
+    finally:
+        # Whatever the poller did — no window, or a raised deadline — the
+        # racers must wake with the stop flag ALREADY set so none slips past
+        # the stop check into a submit that outlives the account lock.
+        if pre is not None:
+            pre_holder["page"] = pre
+        else:
+            stop.set()
+        opened.set()
     if pre is None:
-        stop.set()
-        opened.set()  # wake racers so they exit on the stop check
         return [], None
-    pre_holder["page"] = pre
-    opened.set()
     for thread in threads:
         thread.join(timeout=max(0.0, deadline - time.monotonic()))
     return outcomes, winner
@@ -783,7 +845,7 @@ def execute_plan(
                         probe_ok = False
                     elif page_result.ok:
                         source = getattr(client, "last_parameter_source", "") or "unknown"
-                        message = f"目标日 {target_day.isoformat()}：参数就绪（来源：{source}），可进入提交"
+                        message = f"目标日 {target_day.isoformat()}：参数就绪（来源：{source}），可进入提交；探测为只读，不检查时段是否已被占用"
                         probe_ok = True
                     elif page_result.page_state == "CURRENTLY_OCCUPIED":
                         message = f"目标日页面出现状态提示：{page_result.message}"
@@ -866,31 +928,52 @@ def execute_plan(
                         _set_failure(run, fatal, "; ".join(messages), status=_failure_status(fatal))
                         return run.id
                 else:
-                    pre_resolved = _await_fire_and_prefetch(client, fire_epoch, request_values, target_day, seats[0])
+                    pre_resolved = _await_fire_and_prefetch(client, fire_epoch, request_values, target_day, seats[0], deadline)
         attempts = min(max(plan.max_attempts, len(seats)), MAX_SUBMIT_ATTEMPTS)
         if plan.max_attempts > MAX_SUBMIT_ATTEMPTS:
             messages.append(f"按安全策略将尝试次数从 {plan.max_attempts} 钳制为 {MAX_SUBMIT_ATTEMPTS}")
         # A confirmed-unavailable seat is dead: never spend another submit on
         # it. The parallel opening shot may already have consumed candidates.
         dead_seats = {outcome["seat"] for outcome in parallel_outcomes if outcome["code"] == "SEAT_UNAVAILABLE"}
-        used_attempts = sum(1 for outcome in parallel_outcomes if outcome["submitted"])
+        # A TOKEN_STALE rejection (platform error 303) booked nothing: the
+        # platform explicitly refused the request and asked for a refresh and
+        # resubmit. Counting such a rejection as a spent attempt made a fully
+        # stale volley (every racer got 303) exhaust the whole budget —
+        # range(used_attempts, attempts) came back empty, no refresh-retry
+        # ever ran, and the run died reporting the last racer's code (e.g.
+        # SEAT_UNAVAILABLE) even though live seats remained retryable.
+        used_attempts = sum(1 for outcome in parallel_outcomes if outcome["submitted"] and outcome["code"] != "TOKEN_STALE")
         # Remember the most recent failure code so an exhausted budget is
         # reported with its real cause instead of a blanket "seat taken".
         last_code: str | None = next((outcome["code"] for outcome in reversed(parallel_outcomes) if outcome["code"]), None)
+        # Refresh-retry rotation: after a whole-volley rejection (e.g. every
+        # racer got 303) the budget buys one shot per DISTINCT live seat — it
+        # must not be spent hammering the first candidate four times while
+        # 098/099 never see a refresh retry. Once every live seat had its turn
+        # this round, the order starts over.
+        round_tried: set[str] = set()
         for attempt in range(used_attempts, attempts):
             if time.monotonic() >= deadline:
                 raise ReservationError("DEADLINE_EXCEEDED", "任务超过 60 秒运行上限")
-            seat = next((candidate for candidate in seats if candidate not in dead_seats), None)
+            seat = next((candidate for candidate in seats if candidate not in dead_seats and candidate not in round_tried), None)
+            if seat is None:
+                round_tried.clear()
+                seat = next((candidate for candidate in seats if candidate not in dead_seats), None)
             if seat is None:
                 break  # every candidate is confirmed taken; stop hammering
+            round_tried.add(seat)
             run.selected_seat = seat
+            # The pre-fetch rides ONLY the opening submit. Consume it before
+            # the call so a rejected attempt (a 303 told us its token died)
+            # can never re-submit the same stale page on the retry.
+            pending_pre = pre_resolved
+            pre_resolved = None
             try:
                 message = client.submit_once(
                     request_values["room_id"], seat, request_values["start_time"], request_values["end_time"], target_day,
                     select_params=request_values["select_params"], select_path=request_values["select_context_path"], select_source=request_values["select_context_source"],
-                    pre_resolved=pre_resolved,
+                    pre_resolved=pending_pre,
                 )
-                pre_resolved = None  # only the opening attempt rides the pre-fetch
                 _persist_discovered_context(plan, client)
                 run.parameter_source = getattr(client, "last_parameter_source", "") or "unknown"
                 _append_attempt(

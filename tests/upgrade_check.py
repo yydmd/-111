@@ -189,13 +189,116 @@ def scenario_parallel_fallback_to_serial() -> None:
     db.close()
 
 
+def scenario_parallel_token_stale_recovery() -> None:
+    """Production incident 2026-09-03: full volley rejected with platform 303.
+
+    4 seats fired in parallel; three racers got TOKEN_STALE (安全验证已超时，
+    请刷新后再提交) and one got SEAT_UNAVAILABLE. With the default budget
+    (max_attempts=3 → attempts=4) the stale rejections used to consume the
+    whole serial budget, so no refresh-retry ran and the run reported the last
+    racer's code (座位不可预约) instead of recovering.
+    """
+    factory = make_factory(DATA, "uc-stale")
+    plan_id = make_plan(factory, seats=("097", "098", "099", "100"), max_attempts=3)
+    submits: list[str] = []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+        def login(self): pass
+        def browse(self, *args, **kwargs): pass
+        def clone_authenticated(self):
+            clone = Client()
+            clone.is_clone = True
+            return clone
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+        def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
+            submits.append(seat)
+            self.last_submitted = True
+            if not self.is_clone:
+                return "预约成功"  # the serial refresh-retry wins
+            if seat == "100":
+                raise service.ReservationError("SEAT_UNAVAILABLE", "该时间段已被占用！")
+            raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+
+    service.SessionLocal = factory
+    service.ChaoxingClient = Client
+    service.notify_async = lambda *args, **kwargs: None
+    service._scheduled_fire_epoch = lambda _plan: time.time()
+    service._poll_until_open = lambda *a, **k: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day")
+    service._hold_until_fire = lambda *a, **k: None
+    service.execute_plan(plan_id, trigger="scheduled")
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    check("stale-volley-recovers", run.status == "SUCCESS", f"status={run.status}")
+    # 4 parallel POSTs + exactly one serial refresh-retry; the confirmed-taken
+    # seat is never retried.
+    check("stale-volley-submit-count", len(submits) == 5, f"submits={submits}")
+    check("stale-dead-seat-not-retried", submits.count("100") == 1, f"submits={submits}")
+    check("stale-winner-is-live-seat", run.selected_seat in {"097", "098", "099"}, f"seat={run.selected_seat}")
+    check("stale-audit-complete", len(run.attempt_details) == 5, f"details={len(run.attempt_details)}")
+    db.close()
+
+
+def scenario_stale_exhaustion_keeps_real_code() -> None:
+    """Even when every refresh-retry stays stale, the final verdict must be
+    TOKEN_STALE (with the platform's refresh hint), not seat-unavailable."""
+    factory = make_factory(DATA, "uc-stale2")
+    plan_id = make_plan(factory, seats=("097", "098", "099", "100"), max_attempts=3)
+    submits: list[str] = []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+        def login(self): pass
+        def browse(self, *args, **kwargs): pass
+        def clone_authenticated(self):
+            clone = Client()
+            clone.is_clone = True
+            return clone
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+        def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
+            submits.append(seat)
+            self.last_submitted = True
+            if self.is_clone and seat == "100":
+                raise service.ReservationError("SEAT_UNAVAILABLE", "该时间段已被占用！")
+            raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+
+    service.SessionLocal = factory
+    service.ChaoxingClient = Client
+    service.notify_async = lambda *args, **kwargs: None
+    service._scheduled_fire_epoch = lambda _plan: time.time()
+    service._poll_until_open = lambda *a, **k: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day")
+    service._hold_until_fire = lambda *a, **k: None
+    service.execute_plan(plan_id, trigger="scheduled")
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    check("stale-exhaustion-code", (run.status, run.error_code) == ("FAILED", "TOKEN_STALE"),
+          f"status={run.status} code={run.error_code}")
+    check("stale-exhaustion-refresh-ran", len(submits) > 4, f"submits={len(submits)}")
+    check("stale-exhaustion-hint", "刷新后再提交" in (run.message or ""), "")
+    db.close()
+
+
 def scenario_clock_estimator() -> None:
     import app.clock as clock
 
     data = [(1.0, 10.0), (0.2, 4.0), (0.1, 2.0), (0.3, 6.0), (0.4, 8.0), (0.5, 12.0), (0.25, 5.0), (0.35, 7.0)]
     index = {"i": 0}
 
-    def fake_measure(_url):
+    def fake_measure(_url, _budget=None):
         value = data[index["i"] % len(data)]
         index["i"] += 1
         return value
@@ -206,6 +309,171 @@ def scenario_clock_estimator() -> None:
     # Date-header truncation bias.
     expected = (2.0 + 4.0 + 5.0 + 6.0) / 4 + clock.DATE_HEADER_BIAS_SECONDS
     check("clock-fastest-half-mean", abs(applied - expected) < 1e-9, f"applied={applied:.3f} expected={expected:.3f}")
+
+
+def scenario_clock_budget() -> None:
+    """2026-09-03 audit: clock calibration must stop at its time budget.
+
+    A read-timeout black hole used to let dense probing burn ~96 s of a run
+    that only has 60 s and wakes 30 s early. The fake time module is restored
+    afterwards — a frozen clock left behind would make every later scenario's
+    server_now() disagree with real fire epochs by eons.
+    """
+    import app.clock as clock
+
+    state = {"now": 100.0, "calls": 0}
+    real_time, real_measure = clock.time, clock._measure_once
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return state["now"]
+
+        @staticmethod
+        def time():
+            return state["now"]
+
+    def slow_measure(_url, _budget):
+        state["calls"] += 1
+        state["now"] += 2.0  # each probe "takes" 2 seconds
+        return None
+
+    try:
+        clock.time = FakeTime
+        clock._measure_once = slow_measure
+        clock.refresh(dense=True, budget_seconds=5.0)
+        first_pass = state["calls"]
+        clock.refresh(dense=True)  # default dense budget must also bound itself
+        check("clock-budget-cuts-probes", 0 < first_pass <= 3 and 0 < state["calls"] - first_pass <= 5,
+              f"first={first_pass} total={state['calls']}")
+    finally:
+        clock.time = real_time
+        clock._measure_once = real_measure
+
+
+def scenario_catchup_after_failed_run() -> None:
+    """Production incident 2026-09-03 01:29: run_time moved later the same day.
+
+    The save landed 5 s after the new wake-up moment, so cron went to tomorrow
+    and the only safety net — the recently-missed catch-up — was swallowed by
+    a dedup key that matched the morning attempt's FAILED row for the same
+    (plan, target_date). Only in-flight or SUCCESSFUL runs may block a catch-up.
+    """
+    import app.scheduler as scheduler_module
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    factory = make_factory(DATA, "uc-catchup")
+    plan_id = make_plan(factory, seats=("001",), max_attempts=3)
+    db = factory()
+    plan = db.get(ReservationPlan, plan_id)
+    plan.run_time = "08:00"
+    plan.day_offset = 1
+    db.commit()
+    db.close()
+    db = factory()
+    db.add(ReservationRun(plan_id=plan_id, account_id=1, target_date="2026-09-08", trigger="scheduled", status="FAILED", error_code="TOKEN_STALE", message="failed earlier today"))
+    db.commit()
+    db.close()
+    queued = []
+    scheduler_module.SessionLocal = factory
+    scheduler_module.enqueue_plan = lambda plan_id, trigger: queued.append((plan_id, trigger)) or 1
+    now = dt.datetime(2026, 9, 7, 8, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    count = scheduler_module._enqueue_recently_missed_jobs(now)
+    check("catchup-after-failure", count == 1 and queued == [(plan_id, "scheduled_catchup")], f"queued={queued}")
+    db = factory()
+    db.add(ReservationRun(plan_id=plan_id, account_id=1, target_date="2026-09-08", trigger="scheduled", status="SUCCESS", message="done"))
+    db.commit()
+    db.close()
+    check("catchup-blocked-by-success", scheduler_module._enqueue_recently_missed_jobs(now) == 0, "")
+    db.close()
+
+
+def scenario_serial_rotation() -> None:
+    """2026-09-03 audit: refresh retries after a full-303 volley rotate seats.
+
+    The old fallback always picked the first live seat, spending the whole
+    budget on 097 while 098/099 never saw a refresh retry.
+    """
+    factory = make_factory(DATA, "uc-rotate")
+    plan_id = make_plan(factory, seats=("097", "098", "099"), max_attempts=3)
+    serial_submits: list[str] = []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+        def login(self): pass
+        def browse(self, *args, **kwargs): pass
+        def clone_authenticated(self):
+            clone = Client()
+            clone.is_clone = True
+            return clone
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+        def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
+            self.last_submitted = True
+            if not self.is_clone:
+                serial_submits.append(seat)
+            raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+
+    service.SessionLocal = factory
+    service.ChaoxingClient = Client
+    service.notify_async = lambda *args, **kwargs: None
+    service._scheduled_fire_epoch = lambda _plan: time.time()
+    service._poll_until_open = lambda *a, **k: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day")
+    service._hold_until_fire = lambda *a, **k: None
+    service.execute_plan(plan_id, trigger="scheduled")
+    check("serial-rotation-sweeps", serial_submits == ["097", "098", "099"], f"submits={serial_submits}")
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    check("serial-rotation-verdict", (run.status, run.error_code) == ("FAILED", "TOKEN_STALE"), f"{run.status}/{run.error_code}")
+    db.close()
+
+
+def scenario_patch_toggle_preserves_context() -> None:
+    """2026-09-03 audit: a bare enable/disable toggle must not wipe the
+    discovered select context (the browser used to PATCH a stale full snapshot
+    with select_params=null)."""
+    import app.web as web
+    from app.db import Account
+
+    factory = make_factory(DATA, "uc-patch")
+    db = factory()
+    db.add(Account(id=1, name="a", username="u", password_blob=b"x"))
+    db.commit()
+    web.refresh_jobs = lambda: None
+    web._enqueue_recently_missed_jobs = lambda: 0
+    payload = web.PlanIn(account_id=1, name="p", room_id="10713", seats=["097"], start_time="08:00", end_time="08:30")
+    created = web.create_plan(payload, db)
+    plan = db.get(ReservationPlan, created["id"])
+    plan.select_params_json = '{"id": "10713"}'
+    plan.select_context_path = "/front/third/apps/seat/select"
+    plan.select_context_source = "auto_context"
+    db.commit()
+    web.patch_plan(created["id"], {"enabled": False}, db)
+    plan = db.get(ReservationPlan, created["id"])
+    check("patch-toggle-keeps-context", plan.select_params == {"id": "10713"} and plan.select_context_source == "auto_context",
+          f"params={plan.select_params_json} source={plan.select_context_source}")
+    check("patch-toggle-applies-enabled", plan.enabled is False, f"enabled={plan.enabled}")
+    web.patch_plan(created["id"], {"select_params": None}, db)
+    plan = db.get(ReservationPlan, created["id"])
+    check("patch-explicit-null-clears", plan.select_params is None and plan.select_context_path is None, "")
+    db.close()
+
+
+def scenario_redirect_and_rate_limit_retryable() -> None:
+    """2026-09-03 audit: unknown 30x hops and throttle wording stay retryable."""
+    from app.chaoxing_client import ChaoxingClient
+
+    check("unknown-redirect-retryable",
+          ChaoxingClient._classify_redirect(302, "https://office.chaoxing.com/front/other").code == "HTTP_REDIRECT"
+          and "HTTP_REDIRECT" in service._RETRYABLE_CODES, "")
+    check("rate-limited-retryable", "RATE_LIMITED" in service._RETRYABLE_CODES, "")
 
 
 def scenario_constants() -> None:
@@ -242,7 +510,14 @@ def main() -> int:
     scenario_budget_clamp()
     scenario_parallel_winner()
     scenario_parallel_fallback_to_serial()
+    scenario_parallel_token_stale_recovery()
+    scenario_stale_exhaustion_keeps_real_code()
     scenario_clock_estimator()
+    scenario_clock_budget()
+    scenario_catchup_after_failed_run()
+    scenario_serial_rotation()
+    scenario_patch_toggle_preserves_context()
+    scenario_redirect_and_rate_limit_retryable()
     scenario_constants()
     for line in CHECKS:
         print(line)

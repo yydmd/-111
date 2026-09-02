@@ -249,7 +249,11 @@ class ChaoxingClient:
             return ReservationError("LOGIN_REQUIRED", f"登录会话失效（HTTP {status_code}）")
         if any(marker in loc for marker in SECURITY_REDIRECT_MARKERS):
             return ReservationError("SECURITY_CHALLENGE", f"平台跳转到安全验证（HTTP {status_code}）")
-        return ReservationError("BLOCKED_BY_RISK", f"平台重定向到未知地址（HTTP {status_code}）")
+        # An unrecognised 30x is NOT proof of risk control — token/session
+        # refreshes often hop to the select page or a same-site path. Calling
+        # it BLOCKED_BY_RISK made parallel volleys die fatally and flagged the
+        # account; HTTP_REDIRECT is retryable so the run re-resolves instead.
+        return ReservationError("HTTP_REDIRECT", f"平台重定向到未识别地址（HTTP {status_code}）")
 
     def _request(
         self,
@@ -727,7 +731,16 @@ class ChaoxingClient:
             raise ReservationError("LOGIN_REQUIRED", message or "登录会话失效")
         if any(value in risk_text for value in ("验证码", "captcha", "点选", "滑块")):
             raise ReservationError("CAPTCHA_REQUIRED", message or "平台要求验证码")
-        if any(value in risk_text for value in ("非法", "验证超时", "302", "303", "人数过多", "安全验证", "频繁")):
+        if any(value in risk_text for value in ("刷新后再提交", "安全验证已超时", "页面停留过久", "请刷新后重试", "刷新页面后重试", "请刷新页面")):
+            # ChaoXing error 303: the request was definitively REJECTED (no
+            # double-submit risk) and the platform itself asks for a page
+            # refresh and a resubmit — retryable with a freshly fetched token.
+            raise ReservationError("TOKEN_STALE", message or "页面停留过久，需刷新后重新提交")
+        if any(value in risk_text for value in ("频繁", "too frequent", "请稍后再试")):
+            # Throttling asks us to slow down, not a risk verdict; the serial
+            # path backs off (RETRY_WAIT_RANGE) and retries.
+            raise ReservationError("RATE_LIMITED", message or "操作过于频繁，稍候自动重试")
+        if any(value in risk_text for value in ("非法", "验证超时", "302", "303", "人数过多", "安全验证")):
             raise ReservationError("BLOCKED_BY_RISK", message or "平台拒绝本次请求")
         if any(value in risk_text for value in ("已被", "不可预约", "没有空", "已满", "冲突", "占用")):
             raise ReservationError("SEAT_UNAVAILABLE", message or "座位不可预约")

@@ -14,7 +14,7 @@ from .service import enqueue_plan
 logger = logging.getLogger(__name__)
 # A short wake-up delay should not throw away an opening-window reservation, but
 # we still refuse to replay stale work much later.
-scheduler = BackgroundScheduler(timezone=ZoneInfo("Asia/Shanghai"), job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 15})
+scheduler = BackgroundScheduler(timezone=ZoneInfo("Asia/Shanghai"), job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 90})
 STARTUP_CATCHUP_SECONDS = 90
 # Scheduled plans wake up this many seconds before their run time so login and
 # page warm-up finish before the platform's opening moment; the submit itself
@@ -72,7 +72,7 @@ def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
 
     APScheduler jobs are in memory. A new scheduler created seconds after the
     planned minute otherwise schedules the *next day* and silently loses today.
-    The durable run table prevents a duplicate catch-up.
+    An in-flight run in the durable run table prevents a duplicate catch-up.
     """
     current = now or dt.datetime.now(ZoneInfo("Asia/Shanghai"))
     if current.tzinfo is None:
@@ -93,15 +93,28 @@ def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
             if not 0 < delay <= STARTUP_CATCHUP_SECONDS:
                 continue
             target_date = (current.date() + dt.timedelta(days=plan.day_offset)).isoformat()
+            # Only an IN-FLIGHT run (PENDING/RUNNING) or an already SUCCESSFUL
+            # one for this plan+target-day counts as "already created".
+            # Matching any historical row once swallowed this catch-up on
+            # 2026-09-03: run_time had been moved later the same day, the
+            # earlier attempt's FAILED row matched the (plan, target_date) key,
+            # and the plan silently never ran while the UI kept promising
+            # today's execution. FAILED and other terminal statuses mean the
+            # window was lost — exactly what a catch-up retry is for; a real
+            # double submit is still barred downstream by the
+            # success-fingerprint check plus server-side verification.
             already_created = db.scalar(
                 select(ReservationRun.id).where(
                     ReservationRun.plan_id == plan.id,
                     ReservationRun.target_date == target_date,
                     ReservationRun.trigger.in_(("scheduled", "scheduled_catchup")),
+                    ReservationRun.status.in_(("PENDING", "RUNNING", "SUCCESS")),
                 ).limit(1)
             )
-            if not already_created:
-                plan_ids.append(plan.id)
+            if already_created:
+                logger.info("Plan %s fire moment just passed but run %s is already in flight; no catch-up needed", plan.id, already_created)
+                continue
+            plan_ids.append(plan.id)
     finally:
         db.close()
     for plan_id in plan_ids:

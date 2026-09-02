@@ -167,8 +167,15 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
 
 @event.listens_for(engine, "connect")
-def _enable_sqlite_foreign_keys(connection, _) -> None:
+def _configure_sqlite_connection(connection, _) -> None:
+    # Web workers, the scheduler thread, reservation executors and the notify
+    # pool all touch this file; WAL keeps readers unblocked by the frequent
+    # run-state commits and busy_timeout rides out writer locks instead of
+    # raising (a raise inside execute_plan's finally block would swallow the
+    # real run result).
     connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=5000")
 
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)

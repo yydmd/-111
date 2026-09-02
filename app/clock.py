@@ -31,6 +31,11 @@ PROBE_URLS = (
 MAX_SAMPLES = 3
 # Race-grade calibration used right before an opening-window submit.
 DENSE_SAMPLES = 8
+# A refresh must never outlive its caller: a scheduled run has a 60-second
+# budget and wakes only 30 seconds early, so clock probing stays bounded even
+# when the platform accepts connections but never answers (read black hole).
+DEFAULT_BUDGET_SECONDS = 4.0
+DENSE_BUDGET_SECONDS = 8.0
 TTL_SECONDS = 10 * 60
 # Refuse absurd offsets: if the "server" claims more than this, keep local time.
 SANITY_LIMIT_SECONDS = 300.0
@@ -39,19 +44,35 @@ SANITY_LIMIT_SECONDS = 300.0
 # to fire that much before the platform's own moment.
 DATE_HEADER_BIAS_SECONDS = 0.5
 
-_session = requests.Session()
-_session.trust_env = False
 _lock = threading.Lock()
 _offset = 0.0
 _measured_at = 0.0
 _last_error = ""
 
+# requests.Session is not documented as thread-safe and probes carry Set-Cookie
+# updates into a shared jar; concurrent scheduled runs each probe through
+# their own thread-local session instead of a module global.
+_thread_local = threading.local()
 
-def _measure_once(url: str) -> tuple[float, float] | None:
+
+def _probe_session() -> requests.Session:
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False
+        _thread_local.session = session
+    return session
+
+
+def _measure_once(url: str, budget: float) -> tuple[float, float] | None:
     """Return ``(rtt, offset)`` for one probe, or None when undecodable."""
     before = time.time()
-    response = _session.get(url, timeout=(2, 4), allow_redirects=False,
-                            headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
+    response = _probe_session().get(
+        url,
+        timeout=(max(0.5, min(2.0, budget)), max(0.5, min(4.0, budget))),
+        allow_redirects=False,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"},
+    )
     after = time.time()
     raw_date = response.headers.get("Date", "")
     if not raw_date:
@@ -63,23 +84,31 @@ def _measure_once(url: str) -> tuple[float, float] | None:
     return after - before, server - (before + after) / 2
 
 
-def refresh(dense: bool = False) -> float:
+def refresh(dense: bool = False, budget_seconds: float | None = None) -> float:
     """Re-measure the server offset; returns the applied offset in seconds.
 
     ``dense=True`` gathers more samples for the decisive pre-fire wait. The
     estimator averages the offsets of the *fastest* half of the samples
     (NTP-style filtering: short round trips carry the least one-way-latency
     skew) and compensates the second-truncation bias of the Date header.
+    Probing stops once ``budget_seconds`` elapses — an opening race must wait
+    on the platform's clock, never on clock calibration itself.
     """
     global _offset, _measured_at, _last_error
     wanted = DENSE_SAMPLES if dense else MAX_SAMPLES
+    if budget_seconds is None:
+        budget_seconds = DENSE_BUDGET_SECONDS if dense else DEFAULT_BUDGET_SECONDS
     samples: list[tuple[float, float]] = []
     attempts = 0
+    started = time.monotonic()
     while len(samples) < wanted and attempts < wanted * 2:
+        remaining_budget = budget_seconds - (time.monotonic() - started)
+        if remaining_budget <= 0.5:
+            break
         url = PROBE_URLS[attempts % len(PROBE_URLS)]
         attempts += 1
         try:
-            measured = _measure_once(url)
+            measured = _measure_once(url, remaining_budget)
         except requests.RequestException as exc:
             logger.debug("clock probe failed for %s: %s", url, exc.__class__.__name__)
             continue

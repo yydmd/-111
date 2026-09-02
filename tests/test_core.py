@@ -406,12 +406,17 @@ def test_parse_select_url_extracts_params_and_drops_day():
         parse_select_url("https://office.chaoxing.com/front/third/apps/seat/select?day=2026-09-02")
 
 
-def test_redirect_classification_distinguishes_login_security_and_risk():
+def test_redirect_classification_distinguishes_login_security_and_unknown():
     classify = ChaoxingClient._classify_redirect
     assert classify(302, "https://passport2.chaoxing.com/mlogin").code == "LOGIN_REQUIRED"
     assert classify(303, "https://passport2.chaoxing.com/wlogin1").code == "LOGIN_REQUIRED"
     assert classify(302, "https://captcha.chaoxing.com/captcha/get").code == "SECURITY_CHALLENGE"
-    assert classify(301, "https://office.chaoxing.com/front/other").code == "BLOCKED_BY_RISK"
+    # An unrecognised hop is not proof of risk control (2026-09-03 audit): it
+    # is usually a benign session/page jump, so it must stay retryable.
+    assert classify(301, "https://office.chaoxing.com/front/other").code == "HTTP_REDIRECT"
+    from app.service import _RETRYABLE_CODES
+
+    assert "HTTP_REDIRECT" in _RETRYABLE_CODES
 
 
 def test_request_without_follow_rejects_redirects():
@@ -1444,3 +1449,522 @@ def test_submit_once_past_deadline_is_not_audited_as_submitted():
         client.submit_once("100", "001", "08:00", "09:00", date(2026, 9, 3), pre_resolved=probe)
     assert exc_info.value.code == "DEADLINE_EXCEEDED"
     assert client.last_submitted is False
+
+
+def test_plan_save_refreshes_jobs_and_runs_recent_miss_catchup(tmp_path, monkeypatch):
+    """修复回归：保存计划后也要做“刚错过触发点”的补跑检查，而不是只排到明天。"""
+    import app.web as web
+
+    factory = _test_session_factory(tmp_path)
+    db = factory()
+    db.add(Account(id=1, name="a", username="u", password_blob=b"x"))
+    db.commit()
+    calls = []
+    monkeypatch.setattr(web, "refresh_jobs", lambda: calls.append("refresh"))
+    monkeypatch.setattr(web, "_enqueue_recently_missed_jobs", lambda: calls.append("catchup"))
+    payload = PlanIn(account_id=1, name="p", room_id="10713", seats=["097"], start_time="08:00", end_time="08:30")
+    created = web.create_plan(payload, db)
+    assert calls == ["refresh", "catchup"]
+    # Partial PATCH payload, exactly what the toggle button now sends over
+    # HTTP; the endpoint merges it onto the stored plan.
+    web.patch_plan(created["id"], {"name": "p2"}, db)
+    assert calls == ["refresh", "catchup", "refresh", "catchup"]
+    db.close()
+
+
+def test_submit_once_classifies_stale_page_as_token_stale(monkeypatch):
+    """修复回归：平台 303（请刷新后再提交）是可恢复拒绝，不是终局风控。"""
+    client = ChaoxingClient("u", "p")
+    client.resolve_submission_page = lambda *args, **kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+    class Response:
+        def json(self):
+            return {"success": False, "msg": "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)"}
+
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: Response())
+    with pytest.raises(ReservationError) as exc_info:
+        client.submit_once("100", "001", "08:00", "09:00", date(2026, 9, 3))
+    assert exc_info.value.code == "TOKEN_STALE"
+    assert "TOKEN_STALE" in __import__("app.service", fromlist=["_RETRYABLE_CODES"])._RETRYABLE_CODES
+
+
+def test_volley_token_stale_falls_back_to_serial_refresh(tmp_path, monkeypatch):
+    """修复回归：并行开抢遇到 303 时不终止，串行兜底刷新页面后重试可成功。"""
+    import app.service as service
+
+    submits: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self):
+            pass
+
+        def browse(self, *args, **kwargs):
+            pass
+
+        def clone_authenticated(self):
+            clone = FakeClient()
+            clone.is_clone = True
+            return clone
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            submits.append(seat)
+            self.last_submitted = True
+            if self.is_clone:
+                raise ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+            return "预约成功"
+
+    status, error_code = _run_volley_plan(tmp_path, monkeypatch, FakeClient, seats=("001", "002"), max_attempts=6)
+    # 两个并行 racer 各被拒一次（303），串行兜底刷新重试后成功。
+    assert len(submits) == 3
+    assert (status, error_code) == ("SUCCESS", None)
+
+
+def _full_stale_volley_client(submits, stale_seats, main_submit):
+    """Volley factory: every racer submit raises; the main client behaves per main_submit."""
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self):
+            pass
+
+        def browse(self, *args, **kwargs):
+            pass
+
+        def clone_authenticated(self):
+            clone = FakeClient()
+            clone.is_clone = True
+            return clone
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, *args, **kwargs):
+            submits.append(seat)
+            self.last_submitted = True
+            if not self.is_clone:
+                return main_submit(seat)
+            if seat in stale_seats:
+                raise ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+            raise ReservationError("SEAT_UNAVAILABLE", "该时间段已被占用！")
+
+    return FakeClient
+
+
+def test_full_stale_volley_still_gets_refresh_retry(tmp_path, monkeypatch):
+    """修复回归：整队 303（含 1 个座位占用）不得耗尽预算，串行刷新重试必须执行。
+
+    生产事故：4 个候选座位并行开抢，3 个收到平台 303（要求刷新后重提）、
+    1 个确认占用；默认 max_attempts=3 时旧逻辑 range(4, 4) 为空，一次刷新
+    重试都没做就报“座位不可预约”。
+    """
+    import app.service as service
+
+    monkeypatch.setattr(service.time, "sleep", lambda *_: None)
+    submits: list[str] = []
+    fake = _full_stale_volley_client(submits, stale_seats={"097", "098", "099"}, main_submit=lambda seat: "预约成功")
+    status, error_code = _run_volley_plan(tmp_path, monkeypatch, fake, seats=("097", "098", "099", "100"), max_attempts=3)
+    # 4 次并行提交 + 至少 1 次串行刷新重试（对仍存活的座位）。
+    assert len(submits) == 5
+    assert submits.count("100") == 1  # 确认占用的座位不再重试
+    assert (status, error_code) == ("SUCCESS", None)
+
+
+def test_stale_exhaustion_reports_token_stale_not_seat_unavailable(tmp_path, monkeypatch):
+    """修复回归：刷新重试仍全部 303 时，终局报告真实原因 TOKEN_STALE。
+
+    旧逻辑取“最后一个结果”的错误码（座位占用），把 3 个可重试座位被 303
+    拒绝的真实原因完全掩盖。
+    """
+    import app.service as service
+
+    monkeypatch.setattr(service.time, "sleep", lambda *_: None)
+    submits: list[str] = []
+
+    def always_stale(_seat):
+        raise ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+
+    fake = _full_stale_volley_client(submits, stale_seats={"097", "098", "099"}, main_submit=always_stale)
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("097", "098", "099", "100"), max_attempts=3)
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    monkeypatch.setattr(service, "ChaoxingClient", fake)
+    monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "notify_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_scheduled_fire_epoch", lambda _plan: time.time())
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    monkeypatch.setattr(service, "_hold_until_fire", lambda *_args, **_kwargs: None)
+    service.execute_plan(plan_id, trigger="scheduled")
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    # 串行兜底确实跑了刷新重试（提交数超过并行 volley 的 4 次）。
+    assert len(submits) > 4
+    assert (run.status, run.error_code) == ("FAILED", "TOKEN_STALE")
+    assert "刷新后再提交" in run.message
+    seats_audited = {item["seat"] for item in run.attempt_details}
+    assert "097" in seats_audited  # 刷新重试被记录在审计里
+    db.close()
+
+
+def test_catchup_after_failed_run_still_enqueues(tmp_path, monkeypatch):
+    """2026-09-03 01:29 事故回归：当天已有 FAILED 的同目标日定时 run 不得吞掉补跑。
+
+    用户把 run_time 改晚并在唤醒时刻之后保存，cron 只能排到明天；此前
+    唯一的兜底补跑被 (plan, target_date) 去重命中当天早些时候的 FAILED
+    记录而静默跳过——计划当天从未执行。
+    """
+    import app.scheduler as scheduler_module
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("001",), max_attempts=1)
+    db = factory()
+    plan = db.get(ReservationPlan, plan_id)
+    plan.run_time = "08:00"
+    plan.day_offset = 1
+    plan.weekdays_json = json.dumps(["Monday"])
+    db.commit()
+    db.close()
+    db = factory()
+    db.add(ReservationRun(plan_id=plan_id, account_id=1, target_date="2026-09-08", trigger="scheduled", status="FAILED", error_code="TOKEN_STALE", message="failed earlier today"))
+    db.commit()
+    db.close()
+    queued = []
+    monkeypatch.setattr(scheduler_module, "SessionLocal", factory)
+    monkeypatch.setattr(scheduler_module, "enqueue_plan", lambda plan_id, trigger: queued.append((plan_id, trigger)) or 1)
+    now = datetime(2026, 9, 7, 8, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert scheduler_module._enqueue_recently_missed_jobs(now) == 1
+    assert queued == [(plan_id, "scheduled_catchup")]
+    # 已成功的记录仍然阻塞补跑（当天真的订上了就没有再跑的意义）。
+    db = factory()
+    db.add(ReservationRun(plan_id=plan_id, account_id=1, target_date="2026-09-08", trigger="scheduled", status="SUCCESS", message="done"))
+    db.commit()
+    db.close()
+    assert scheduler_module._enqueue_recently_missed_jobs(now) == 0
+
+
+def test_patch_toggle_keeps_discovered_select_context(tmp_path, monkeypatch):
+    """2026-09-03 审计回归：启停切换（部分 PATCH）不得清空已发现的选座参数。"""
+    import app.web as web
+
+    factory = _test_session_factory(tmp_path)
+    db = factory()
+    db.add(Account(id=1, name="a", username="u", password_blob=b"x"))
+    db.commit()
+    monkeypatch.setattr(web, "refresh_jobs", lambda: None)
+    monkeypatch.setattr(web, "_enqueue_recently_missed_jobs", lambda: 0)
+    payload = PlanIn(account_id=1, name="p", room_id="10713", seats=["097"], start_time="08:00", end_time="08:30")
+    created = web.create_plan(payload, db)
+    plan = db.get(ReservationPlan, created["id"])
+    plan.select_params_json = json.dumps({"id": "10713"})
+    plan.select_context_path = "/front/third/apps/seat/select"
+    plan.select_context_source = "auto_context"
+    plan.select_context_checked_at = datetime(2026, 9, 3, 1, 0)
+    db.commit()
+
+    web.patch_plan(created["id"], {"enabled": False}, db)
+    plan = db.get(ReservationPlan, created["id"])
+    assert plan.enabled is False
+    assert plan.select_params == {"id": "10713"}
+    assert plan.select_context_path == "/front/third/apps/seat/select"
+    assert plan.select_context_source == "auto_context"
+    assert plan.select_context_checked_at == datetime(2026, 9, 3, 1, 0)
+
+    # 显式携带 select_params=null 的全量表单提交仍然清除参数（编辑表单语义）。
+    web.patch_plan(created["id"], {"select_params": None}, db)
+    plan = db.get(ReservationPlan, created["id"])
+    assert plan.select_params is None
+    assert plan.select_context_path is None
+    assert plan.select_context_checked_at is None
+    db.close()
+
+
+def test_plan_rejects_run_time_before_half_past_midnight():
+    """调度在 00:00–00:29 的 run_time 会提前唤醒长达半小时，超出 60 秒运行上限。"""
+    import app.web as web
+
+    base = {"account_id": 1, "name": "p", "room_id": "10713", "seats": ["097"], "start_time": "08:00", "end_time": "08:30"}
+    with pytest.raises(Exception):
+        web.PlanData.model_validate({**base, "run_time": "00:10"})
+    accepted = web.PlanData.model_validate({**base, "run_time": "00:30"})
+    assert accepted.run_time == "00:30"
+
+
+def test_serial_refresh_retry_rotates_candidate_seats(tmp_path, monkeypatch):
+    """2026-09-03 审计回归：整队 303 后，刷新重试必须轮换候选座位。
+
+    旧的兜底循环永远选第一个未确认占用的座位，3 次刷新重试全部砸在
+    097 上，098/099 一次也得不到。
+    """
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("097", "098", "099"), max_attempts=3)
+    serial_submits: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.is_clone = False
+            self.last_parameter_source = "room_context"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self): pass
+
+        def browse(self, *args, **kwargs): pass
+
+        def clone_authenticated(self):
+            clone = FakeClient()
+            clone.is_clone = True
+            return clone
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "fast", source="target_day")
+
+        def resolve_submission_page(self, *args, **kwargs):
+            return ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+        def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
+            self.last_submitted = True
+            if not self.is_clone:
+                serial_submits.append(seat)
+            raise ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
+    monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "notify_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_scheduled_fire_epoch", lambda _plan: time.time())
+    monkeypatch.setattr(
+        service, "_poll_until_open",
+        lambda *_args, **_kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day"),
+    )
+    monkeypatch.setattr(service, "_hold_until_fire", lambda *_args, **_kwargs: None)
+    service.execute_plan(plan_id, trigger="scheduled")
+    assert serial_submits == ["097", "098", "099"]
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    assert (run.status, run.error_code) == ("FAILED", "TOKEN_STALE")
+    db.close()
+
+
+def test_single_seat_stale_retry_refetches_page(tmp_path, monkeypatch):
+    """2026-09-03 审计回归：单座位串行 303 后的重试必须重新取页。
+
+    pre_resolved 只能搭第一次提交；被 303 拒绝后仍复用同一旧 token 提交
+    是上次事故根因（token 太旧）的单座位残留路径。
+    """
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("097",), max_attempts=3)
+    fresh_resolves: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.last_parameter_source = "target_day"
+            self.last_submitted = False
+            self.last_discovered_select_params = None
+
+        def login(self): pass
+
+        def browse(self, *args, **kwargs): pass
+
+        def submit_once(self, room, seat, start, end, day, select_params=None, pre_resolved=None, **kwargs):
+            self.last_submitted = True
+            if pre_resolved is not None:
+                raise ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+            fresh_resolves.append(seat)  # 重新取页后成功
+            return "预约成功"
+
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    monkeypatch.setattr(service, "ChaoxingClient", FakeClient)
+    monkeypatch.setattr(service, "decrypt_password", lambda _: "password")
+    monkeypatch.setattr(service, "notify_async", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "_scheduled_fire_epoch", lambda _plan: time.time())
+    monkeypatch.setattr(
+        service, "_await_fire_and_prefetch",
+        lambda *_args, **_kwargs: ProbeResult(True, "stale-tok", "algo", "none", "TOKEN_READY", "pre", source="target_day"),
+    )
+    service.execute_plan(plan_id, trigger="scheduled")
+    assert fresh_resolves == ["097"]
+    db = factory()
+    run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
+    assert run.status == "SUCCESS"
+    db.close()
+
+
+def test_submit_once_classifies_rate_limit_and_phrase_variants(monkeypatch):
+    """限流（"频繁"）是可重试退避，不是终局风控；303 变体短语仍归 TOKEN_STALE。"""
+    client = ChaoxingClient("u", "p")
+    client.resolve_submission_page = lambda *args, **kwargs: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "ready", source="target_day")
+
+    class Response:
+        def __init__(self, msg):
+            self._msg = msg
+
+        def json(self):
+            return {"success": False, "msg": self._msg}
+
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: Response("操作过于频繁，请稍后再试"))
+    with pytest.raises(ReservationError) as exc_info:
+        client.submit_once("100", "001", "08:00", "09:00", date(2026, 9, 3))
+    assert exc_info.value.code == "RATE_LIMITED"
+    from app.service import _RETRYABLE_CODES
+
+    assert "RATE_LIMITED" in _RETRYABLE_CODES
+
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: Response("页面停留时间过长，请刷新页面后重试"))
+    with pytest.raises(ReservationError) as exc_info:
+        client.submit_once("100", "001", "08:00", "09:00", date(2026, 9, 3))
+    assert exc_info.value.code == "TOKEN_STALE"
+
+
+def test_poll_until_open_raises_at_deadline(monkeypatch):
+    """纵深防御：窗口迟迟不开时 poller 必须在 deadline 抛错，不得无限空转。"""
+    import app.service as service
+
+    class NeverOpenClient:
+        def fetch_target_day_page(self, *args, **kwargs):
+            raise ReservationError("TARGET_DAY_NOT_OPEN", "未开放")
+
+    monkeypatch.setattr(service.app_clock, "server_now", lambda: 1000.0)
+    with pytest.raises(ReservationError) as exc_info:
+        service._poll_until_open(
+            NeverOpenClient(), 1000.5,
+            {"select_params": None, "room_id": "100", "select_context_path": None},
+            date(2026, 9, 4), deadline=time.monotonic() - 1,
+        )
+    assert exc_info.value.code == "DEADLINE_EXCEEDED"
+
+
+def test_poll_until_open_refetches_stale_page_at_fire(monkeypatch):
+    """fire 时刻缓存的页面过旧（>1s）时，先再取一次新页面，失败才回退旧页。"""
+    import app.service as service
+
+    state = {"monotonic": 0.0, "clock": 1005.0}
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return state["monotonic"]
+
+        @staticmethod
+        def sleep(_seconds):
+            state["monotonic"] += 1.5
+            state["clock"] += 1.5
+
+    monkeypatch.setattr(service, "time", FakeTime)
+    monkeypatch.setattr(service.app_clock, "server_now", lambda: state["clock"])
+
+    class Client:
+        def __init__(self):
+            self.fetches = 0
+
+        def fetch_target_day_page(self, *args, **kwargs):
+            self.fetches += 1
+            if self.fetches == 1:
+                return ProbeResult(True, "old", "algo", "none", "TOKEN_READY", "old page", source="target_day")
+            return ProbeResult(True, "new", "algo", "none", "TOKEN_READY", "fresh page", source="target_day")
+
+    client = Client()
+    result = service._poll_until_open(
+        client, 1006.0,
+        {"select_params": None, "room_id": "100", "select_context_path": None},
+        date(2026, 9, 4), deadline=FakeTime.monotonic() + 60,
+    )
+    assert result.message == "fresh page"
+    assert client.fetches == 2
+
+
+def test_clock_refresh_respects_time_budget(monkeypatch):
+    """clock 校准必须在预算内结束：读超时黑洞下不能再烧掉几十秒运行预算。"""
+    import app.clock as clock
+
+    state = {"now": 0.0, "calls": 0}
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return state["now"]
+
+        @staticmethod
+        def time():
+            return state["now"]
+
+    def fake_measure(_url, _budget):
+        state["calls"] += 1
+        state["now"] += 1.0  # 每次探测"耗时" 1 秒
+        return None
+
+    monkeypatch.setattr(clock, "time", FakeTime)
+    monkeypatch.setattr(clock, "_measure_once", fake_measure)
+    clock.refresh(dense=True, budget_seconds=3.0)
+    assert state["calls"] == 3  # 8 个想要的样本只拿到预算允许的 3 次机会
+
+
+def test_run_endpoints_reject_when_account_busy(tmp_path, monkeypatch):
+    """同一账号已有任务排队/执行中时，probe/discover/run 直接 409。"""
+    import app.web as web
+
+    factory = _test_session_factory(tmp_path)
+    db = factory()
+    db.add(Account(id=1, name="a", username="u", password_blob=b"x"))
+    db.commit()
+    monkeypatch.setattr(web, "refresh_jobs", lambda: None)
+    monkeypatch.setattr(web, "_enqueue_recently_missed_jobs", lambda: 0)
+    payload = PlanIn(account_id=1, name="p", room_id="10713", seats=["097"], start_time="08:00", end_time="08:30")
+    created = web.create_plan(payload, db)
+    db.add(ReservationRun(plan_id=created["id"], account_id=1, target_date="2026-09-08", trigger="manual", status="RUNNING", message="busy"))
+    db.commit()
+    for endpoint in (web.probe_plan, web.discover_plan_context, web.run_plan):
+        with pytest.raises(Exception) as exc_info:
+            endpoint(created["id"], db)
+        assert exc_info.value.status_code == 409
+    db.close()
+
+
+def test_next_run_at_reads_live_scheduler():
+    """/api/plans 的 next_run_at 来自真实调度器，而非浏览器推算。"""
+    from types import SimpleNamespace
+
+    import app.web as web
+    from apscheduler.triggers.date import DateTrigger
+
+    plan_stub = SimpleNamespace(id=999911, enabled=True)
+    assert web._next_run_at(SimpleNamespace(id=1, enabled=False)) is None
+    fire_moment = datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(minutes=5)
+    try:
+        web.scheduler.start(paused=True)
+        web.scheduler.add_job(lambda: None, DateTrigger(run_date=fire_moment), id="plan-999911", replace_existing=True)
+        value = web._next_run_at(plan_stub)
+        assert value is not None
+        parsed = datetime.fromisoformat(value)
+        assert abs((parsed - (fire_moment + timedelta(seconds=30))).total_seconds()) < 1
+    finally:
+        try:
+            web.scheduler.remove_job("plan-999911")
+        except Exception:
+            pass
+        web.scheduler.shutdown(wait=False)
