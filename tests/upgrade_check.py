@@ -205,6 +205,7 @@ def scenario_parallel_token_stale_recovery() -> None:
     class Client:
         def __init__(self, *args, **kwargs):
             self.is_clone = False
+            self.parent_calls = 0
             self.last_parameter_source = "room_context"
             self.last_submitted = False
             self.last_discovered_select_params = None
@@ -222,7 +223,10 @@ def scenario_parallel_token_stale_recovery() -> None:
             submits.append(seat)
             self.last_submitted = True
             if not self.is_clone:
-                return "预约成功"  # the serial refresh-retry wins
+                self.parent_calls += 1
+                if self.parent_calls > 1:
+                    return "预约成功"  # the serial refresh-retry wins
+                raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
             if seat == "100":
                 raise service.ReservationError("SEAT_UNAVAILABLE", "该时间段已被占用！")
             raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
@@ -237,12 +241,12 @@ def scenario_parallel_token_stale_recovery() -> None:
     db = factory()
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     check("stale-volley-recovers", run.status == "SUCCESS", f"status={run.status}")
-    # 3 个 303 座位各 1+2 次自愈 = 9 发 + 占用座位 1 发 + 恰好 1 次串行刷新重试；
-    # the confirmed-taken seat is never healed nor retried.
-    check("stale-volley-submit-count", len(submits) == 11, f"submits={submits}")
+    # 父会枪 303(1) + 3 个 303 座位各 1+2 次自愈(9) + 占用座位 1 发 + 恰好 1 次串行
+    # 刷新重试；the confirmed-taken seat is never healed nor retried.
+    check("stale-volley-submit-count", len(submits) == 12, f"submits={submits}")
     check("stale-dead-seat-not-retried", submits.count("100") == 1, f"submits={submits}")
     check("stale-winner-is-live-seat", run.selected_seat in {"097", "098", "099"}, f"seat={run.selected_seat}")
-    check("stale-audit-complete", len(run.attempt_details) == 11, f"details={len(run.attempt_details)}")
+    check("stale-audit-complete", len(run.attempt_details) == 12, f"details={len(run.attempt_details)}")
     db.close()
 
 
@@ -274,8 +278,14 @@ def scenario_volley_heal_in_place() -> None:
         def submit_once(self, room, seat, start, end, day, select_params=None, **kwargs):
             self.last_submitted = True
             submits.append(seat)
+            if not self.is_clone:
+                # 父会话首枪被 303 拒（与实战一致）。
+                raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
+            if seat != "097":
+                # 其余座位终局占用（不自愈），保证 097 是唯一可能的赢家。
+                raise service.ReservationError("SEAT_UNAVAILABLE", "该时间段已被占用！")
             tries[seat] = tries.get(seat, 0) + 1
-            if self.is_clone and tries[seat] == 1:
+            if tries[seat] == 1:
                 raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
             return "预约成功"
 
@@ -289,7 +299,7 @@ def scenario_volley_heal_in_place() -> None:
     db = factory()
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     check("heal-in-place-wins", (run.status, run.selected_seat) == ("SUCCESS", "097"), f"{run.status}/{run.selected_seat}")
-    check("heal-in-place-submits", submits.count("097") == 2, f"submits={submits}")
+    check("heal-in-place-submits", submits.count("097") == 3, f"submits={submits}")
     healed = next(a for a in run.attempt_details if a["seat"] == "097" and a["code"] is None)
     check("heal-telemetry-recorded", {"page_ms", "submit_ms", "token_age_ms", "heals"} <= set(healed.get("timing", {})),
           f"timing={healed.get('timing')}")
@@ -322,7 +332,8 @@ def scenario_late_submit_unknown() -> None:
                 if not released.wait(3):
                     raise service.ReservationError("NETWORK_ERROR", "读超时")
                 return "预约成功"
-            raise AssertionError("主会话在此场景不应提交")
+            # 父会话首枪快速被 303 拒，把场景留给卡死的 racer。
+            raise service.ReservationError("TOKEN_STALE", "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:303)")
         def clone_authenticated(self):
             clone = Client()
             clone.is_clone = True
@@ -340,7 +351,7 @@ def scenario_late_submit_unknown() -> None:
             __import__("datetime").date(2026, 9, 4), ["097"], time.time(), time.monotonic() + 0.3,
         )
         check("late-submit-audited",
-              winner is None and [(o["seat"], o["code"]) for o in outcomes] == [("097", "SUBMIT_OUTCOME_UNKNOWN")],
+              winner is None and [(o["seat"], o["code"]) for o in outcomes] == [("097", "TOKEN_STALE"), ("097", "SUBMIT_OUTCOME_UNKNOWN")],
               f"outcomes={[(o['seat'], o['code']) for o in outcomes]}")
         check("late-submit-client-extended", client.deadline is not None and client.deadline > time.monotonic(),
               f"deadline={client.deadline}")
@@ -533,7 +544,8 @@ def scenario_serial_rotation() -> None:
     service._poll_until_open = lambda *a, **k: ProbeResult(True, "tok", "algo", "none", "TOKEN_READY", "open", source="target_day")
     service._hold_until_fire = lambda *a, **k: None
     service.execute_plan(plan_id, trigger="scheduled")
-    check("serial-rotation-sweeps", serial_submits == ["097", "098", "099"], f"submits={serial_submits}")
+    # 首条为父会话首枪（097 被 303 拒），其后是串行轮换 097→098→099。
+    check("serial-rotation-sweeps", serial_submits == ["097", "097", "098", "099"], f"submits={serial_submits}")
     db = factory()
     run = db.scalar(select(ReservationRun).order_by(ReservationRun.id.desc()))
     check("serial-rotation-verdict", (run.status, run.error_code) == ("FAILED", "TOKEN_STALE"), f"{run.status}/{run.error_code}")
@@ -584,7 +596,7 @@ def scenario_redirect_and_rate_limit_retryable() -> None:
 def scenario_constants() -> None:
     check("jitter-compressed", service.FIRE_JITTER_RANGE == (0.0, 0.05), str(service.FIRE_JITTER_RANGE))
     check("first-pass-compressed", service.FIRST_PASS_WAIT_RANGE == (0.05, 0.15), str(service.FIRST_PASS_WAIT_RANGE))
-    check("retry-compressed", service.RETRY_WAIT_RANGE == (0.3, 0.6), str(service.RETRY_WAIT_RANGE))
+    check("retry-compressed", service.RETRY_WAIT_RANGE == (0.2, 0.45), str(service.RETRY_WAIT_RANGE))
     check("budget-raised", service.MAX_SUBMIT_ATTEMPTS == 6, str(service.MAX_SUBMIT_ATTEMPTS))
     check("opening-codes-retryable", {"TARGET_CONTEXT_UNAVAILABLE", "TARGET_DAY_NOT_OPEN"} <= service._RETRYABLE_CODES)
     check("ui-cap-synced", True)  # verified by pydantic model below

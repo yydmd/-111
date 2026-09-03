@@ -16,7 +16,7 @@ from . import chaoxing_client as _chaoxing_client
 from . import clock as app_clock
 from .chaoxing_client import CAPTCHA_TYPES, ChaoxingClient, ProbeResult, ReservationError
 from .notify import submit_async as notify_async
-from .db import Account, ReservationPlan, ReservationRun, SessionLocal
+from .db import Account, AppSetting, ReservationPlan, ReservationRun, SessionLocal
 from .security import decrypt_password, redact
 from .validation import normalize_time, validate_reservation_time_range
 
@@ -58,7 +58,11 @@ DENSE_WINDOW_BEFORE_FIRE = 0.3
 OPENING_GRACE_SECONDS = 3.0
 FIRE_BUSY_STEP = 0.005
 FIRST_PASS_WAIT_RANGE = (0.05, 0.15)
-RETRY_WAIT_RANGE = (0.3, 0.6)
+# 2026-09-03 speed round: the opening switch is the platform's own busy
+# moment and every observed volley already retried through it; 0.3–0.6s
+# serial spacing only ceded the window. 0.2–0.45s keeps the jitter (no
+# fingerprintable cadence) while halving the worst-case recovery gap.
+RETRY_WAIT_RANGE = (0.2, 0.45)
 # A cached opening page older than this at the fire moment gets one more
 # fetch before it is submitted: a page that aged through failed re-fetches is
 # exactly what the platform rejects with error 303 (TOKEN_STALE).
@@ -78,6 +82,19 @@ RACER_STAGGER_SECONDS = 0.05
 LATE_SUBMIT_GRACE_SECONDS = 2.5
 # Server verification after the deadline needs a live session.
 VERIFY_BUDGET_SECONDS = 8.0
+# Fire-moment auto-calibration. Run #235 telemetry showed the platform
+# answers 303 to EVERYTHING for the first ~1.5s after the configured moment —
+# the true accept moment sits later than run_time. Each scheduled run records
+# when its first submission got a real answer; an EMA of those offsets shifts
+# later fires onto the accept moment (minus a small safety lead), so the
+# parent shot lands instead of 303-ing into a still-switching door.
+_CALIBRATION_SETTING_KEY = "fire_accept_calibration"
+_CALIBRATION_ALPHA = 0.5
+_CALIBRATION_MAX_SECONDS = 5.0
+_CALIBRATION_SAFETY_LEAD = 0.2
+# Codes that mean "the platform evaluated this booking" (a real answer, not
+# the switch-window 303 nor a transport/page failure).
+_ACCEPT_SIGNAL_CODES = {None, "SEAT_UNAVAILABLE", "SUBMIT_REJECTED", "RATE_LIMITED", "HTTP_REDIRECT"}
 # How many candidate seats submit simultaneously at the opening moment. The
 # web UI caps a plan's candidate pool at the same number, so a full pool can
 # be covered by one all-at-once volley.
@@ -362,14 +379,49 @@ def _wait_first_pass(deadline: float) -> None:
     time.sleep(min(delay, remaining))
 
 
-def _scheduled_fire_epoch(plan: ReservationPlan) -> float | None:
+def _load_fire_calibration(db) -> tuple[float, int]:
+    """(ema_offset_seconds, sample_count); (0.0, 0) when never measured."""
+    try:
+        row = db.get(AppSetting, _CALIBRATION_SETTING_KEY) if db is not None else None
+        data = json.loads(row.value) if row and row.value else {}
+        return min(max(float(data.get("ema", 0.0)), 0.0), _CALIBRATION_MAX_SECONDS), int(data.get("samples", 0))
+    except Exception:
+        return 0.0, 0
+
+
+def _record_accept_offset(db, offset: float) -> float | None:
+    """Fold one observed fire→accept offset into the stored EMA.
+
+    Only genuine positive shifts teach the calibration (a negative or absurd
+    offset means the platform answered before our fire or something odd
+    happened); a calibration failure must never break the run itself.
+    """
+    if not 0.0 < offset <= _CALIBRATION_MAX_SECONDS * 2:
+        return None
+    ema, samples = _load_fire_calibration(db)
+    ema = offset if samples == 0 else ema + _CALIBRATION_ALPHA * (offset - ema)
+    ema = min(max(ema, 0.0), _CALIBRATION_MAX_SECONDS)
+    row = db.get(AppSetting, _CALIBRATION_SETTING_KEY)
+    payload = json.dumps({"ema": round(ema, 3), "samples": samples + 1})
+    if row is None:
+        db.add(AppSetting(key=_CALIBRATION_SETTING_KEY, value=payload))
+    else:
+        row.value = payload
+    db.commit()
+    return ema
+
+
+def _scheduled_fire_epoch(plan: ReservationPlan, db=None) -> float | None:
     """Server-clock epoch when a scheduled run may submit.
 
     The plan's run time is treated as the platform's wall-clock opening moment;
     a dense clock calibration runs right before the decisive wait (see
     ``clock.refresh(dense=True)``). A small random jitter keeps every day's
     firing time from being bit-identical. Runs that already missed the moment
-    fire immediately instead of waiting a day.
+    fire immediately instead of waiting a day. Past runs' measured
+    accept-moment offsets (see ``_record_accept_offset``) additionally shift
+    the fire onto the platform's true accept moment; with no samples yet the
+    behaviour is exactly the uncalibrated race.
     """
     try:
         hour, minute = map(int, plan.run_time.split(":", 1))
@@ -380,7 +432,21 @@ def _scheduled_fire_epoch(plan: ReservationPlan) -> float | None:
     now_server = dt.datetime.fromtimestamp(now_epoch, SHANGHAI)
     target = now_server.replace(hour=hour, minute=minute, second=0, microsecond=0) + dt.timedelta(seconds=random.uniform(*FIRE_JITTER_RANGE))
     target_epoch = target.timestamp()
-    return target_epoch if target_epoch > now_epoch else now_epoch
+    base = target_epoch if target_epoch > now_epoch else now_epoch
+    owned_db = None
+    if db is None:
+        owned_db = SessionLocal()
+        db = owned_db
+    try:
+        ema, samples = _load_fire_calibration(db)
+    finally:
+        if owned_db is not None:
+            owned_db.close()
+    if ema > 0:
+        shift = max(0.0, ema - _CALIBRATION_SAFETY_LEAD)
+        base += shift
+        logger.info("fire calibration applied: +%.2fs (EMA of %d run(s))", shift, samples)
+    return base
 
 
 def _hold_until_fire(fire_epoch: float) -> None:
@@ -548,15 +614,27 @@ def _parallel_opening_shot(
         heals_left = RACER_HEAL_ATTEMPTS
         while True:
             # 2) Shortest path: one GET on the poller-verified context. Only an
-            #    unusable answer falls back to the full resolver chain.
+            #    unusable answer falls back to the full resolver chain. The
+            #    FINAL heal inverts the order: the full chain is the only path
+            #    that ever landed submissions in the field (4/4 successes),
+            #    so when the cheap retries are spent the racer goes heavy.
             resolve_started = time.monotonic()
             resolved = None
-            try:
-                fast = racer.fetch_target_day_page(target_day, dict(verified_context), select_path)
-                if fast is not None and (fast.ok or fast.captcha_type in CAPTCHA_TYPES):
-                    resolved = fast
-            except Exception:
-                resolved = None  # any surprise falls back to the full resolver
+            if heals_left == 0:
+                try:
+                    resolved = racer.resolve_submission_page(
+                        room_id, seat, target_day,
+                        select_params=select_params, select_path=select_path, select_source=select_source,
+                    )
+                except ReservationError:
+                    resolved = None
+            if resolved is None:
+                try:
+                    fast = racer.fetch_target_day_page(target_day, dict(verified_context), select_path)
+                    if fast is not None and (fast.ok or fast.captcha_type in CAPTCHA_TYPES):
+                        resolved = fast
+                except Exception:
+                    resolved = None  # any surprise falls back to the full resolver
             if resolved is None:
                 try:
                     resolved = racer.resolve_submission_page(
@@ -579,6 +657,7 @@ def _parallel_opening_shot(
             if heals_used:
                 timing["heals"] = heals_used
             submit_started = time.monotonic()
+            timing["at"] = round(app_clock.server_now(), 3)
             with guard:
                 submitting.add(seat)
             try:
@@ -623,7 +702,8 @@ def _parallel_opening_shot(
     # start so no scheduling surprise can race the assignment.
     pre_holder: dict = {"page": None}
     threads = [
-        threading.Thread(target=race, args=(seat, client.clone_authenticated(), index), name=f"opening-{seat}")
+        # Stagger slot 0 is reserved for the parent shot below; racers follow.
+        threading.Thread(target=race, args=(seat, client.clone_authenticated(), index + 1), name=f"opening-{seat}")
         for index, seat in enumerate(workers)
     ]
     for thread in threads:
@@ -637,18 +717,64 @@ def _parallel_opening_shot(
     finally:
         # Whatever the poller did — no window, or a raised deadline — the
         # racers must wake with the stop flag ALREADY set so none slips past
-        # the stop check into a submit that outlives the account lock.
+        # the stop check into a submit that outlives the account lock. When
+        # the window did open, the wake-up is deferred until after the parent
+        # shot below: the parent fires strictly first and the racers only
+        # engage when it did not win.
         if pre is not None:
             pre_holder["page"] = pre
         else:
             stop.set()
-        opened.set()
+            opened.set()
     if pre is None:
         return [], None
     logger.info(
         "opening window detected: server_epoch=%.3f fire=%.3f delta_ms=%.0f",
         app_clock.server_now(), fire_epoch, (app_clock.server_now() - fire_epoch) * 1000,
     )
+    try:
+        # 4) Parent shot: every field success so far (4/4) came from the
+        # parent session's own page chain while the racers' shortcut drew
+        # 303, so the parent fires FIRST — riding the poller's freshest page
+        # of its own session (zero extra fetch, ~1 RTT after the opening
+        # moment). Its outcome flows through the same outcomes list:
+        # TOKEN_STALE stays budget-free, an occupied seat dies, first success
+        # stops everything.
+        pre_taken_at = time.monotonic()
+        _hold_until_fire(fire_epoch)
+        parent_timing = {
+            "at": round(app_clock.server_now(), 3),
+            "page_ms": 0.0,
+            "token_age_ms": round((time.monotonic() - pre_taken_at) * 1000, 1),
+        }
+        parent_started = time.monotonic()
+        try:
+            message = client.submit_once(
+                room_id, workers[0], start_time, end_time, target_day,
+                select_params=select_params, select_path=select_path, select_source=select_source,
+                pre_resolved=pre,
+            )
+        except ReservationError as exc:
+            parent_timing["submit_ms"] = round((time.monotonic() - parent_started) * 1000, 1)
+            outcomes.append({
+                "seat": workers[0], "code": exc.code, "message": exc.message,
+                "submitted": bool(getattr(client, "last_submitted", False)),
+                "source": getattr(client, "last_parameter_source", "") or "unknown",
+                "timing": parent_timing,
+            })
+        else:
+            parent_timing["submit_ms"] = round((time.monotonic() - parent_started) * 1000, 1)
+            outcomes.append({"seat": workers[0], "code": None, "message": message, "submitted": True,
+                             "source": getattr(client, "last_parameter_source", "") or "unknown",
+                             "timing": parent_timing})
+            winner = outcomes[-1]
+            stop.set()
+    finally:
+        opened.set()
+    if winner is not None:
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline + LATE_SUBMIT_GRACE_SECONDS - time.monotonic()))
+        return outcomes, winner
     for thread in threads:
         thread.join(timeout=max(0.0, deadline - time.monotonic()))
     # A racer's POST may still be on the wire past the deadline (per-request
@@ -768,6 +894,7 @@ def execute_plan(
     started_monotonic = time.monotonic()
     deadline = started_monotonic + RUN_LIMIT_SECONDS
     run: ReservationRun | None = None
+    fire_epoch: float | None = None
     try:
         plan = db.get(ReservationPlan, plan_id)
         if run_id:
@@ -957,6 +1084,9 @@ def execute_plan(
         winner: dict | None = None
         if trigger in {"scheduled", "scheduled_catchup"}:
             fire_epoch = _scheduled_fire_epoch(plan)
+            ema, samples = _load_fire_calibration(db)
+            if ema > 0:
+                messages.append(f"开火校准：按最近 {samples} 次实测把开抢时刻后移 {max(0.0, ema - _CALIBRATION_SAFETY_LEAD):.1f} 秒")
             if fire_epoch is not None:
                 # Warm the session like a person already sitting on the page,
                 # then hold the submit until the platform's own clock says so.
@@ -1055,11 +1185,12 @@ def execute_plan(
                 break  # every candidate is confirmed taken; stop hammering
             round_tried.add(seat)
             run.selected_seat = seat
-            # The pre-fetch rides ONLY the opening submit. Consume it before
+            # The pre-fetch rides ONLY the first submit. Consume it before
             # the call so a rejected attempt (a 303 told us its token died)
             # can never re-submit the same stale page on the retry.
             pending_pre = pre_resolved
             pre_resolved = None
+            attempt_at = app_clock.server_now()
             try:
                 message = client.submit_once(
                     request_values["room_id"], seat, request_values["start_time"], request_values["end_time"], target_day,
@@ -1075,6 +1206,7 @@ def execute_plan(
                     submitted=bool(getattr(client, "last_submitted", True)),
                     code=None,
                     message=message,
+                    timing={"at": round(attempt_at, 3)},
                 )
                 run.status = "SUCCESS"
                 run.error_code = None
@@ -1092,6 +1224,7 @@ def execute_plan(
                     submitted=bool(getattr(client, "last_submitted", False)),
                     code=exc.code,
                     message=exc.message,
+                    timing={"at": round(attempt_at, 3)},
                 )
                 messages.append(f"第 {attempt + 1} 次，座位 {seat}：{exc.code} {exc.message}")
                 if exc.code == "SEAT_UNAVAILABLE":
@@ -1137,6 +1270,23 @@ def execute_plan(
             lock.release()
         if run is not None:
             run.finished_at = datetime.now(dt.UTC).replace(tzinfo=None)
+            if fire_epoch is not None and not probe_only:
+                # Fold "when did the platform first give a real answer" into
+                # the fire calibration (see problems.txt). Wrapped so a
+                # calibration hiccup can never break the run's own result.
+                try:
+                    accept_at = min(
+                        (
+                            item["timing"]["at"]
+                            for item in run.attempt_details
+                            if isinstance(item.get("timing"), dict) and item.get("submitted") and item.get("code") in _ACCEPT_SIGNAL_CODES
+                        ),
+                        default=None,
+                    )
+                    if accept_at is not None:
+                        _record_accept_offset(db, accept_at - fire_epoch)
+                except Exception:
+                    logger.debug("fire calibration update failed", exc_info=True)
             db.commit()
             if run.status in _NOTIFY_STATUSES and run.trigger not in {"probe", "discover"}:
                 title = f"抢座 {run.status}：{run.plan_name or run.plan_id or ''} {run.target_date or ''}".strip()
