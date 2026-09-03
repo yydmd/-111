@@ -722,6 +722,10 @@ class ChaoxingClient:
             raise
         except ValueError as exc:
             raise ReservationError("SUBMIT_OUTCOME_UNKNOWN", "提交请求已发出，但响应无法解析；请先在超星端核实") from exc
+        if not isinstance(payload, dict):
+            # e.g. a WAF/proxy answering 200 with a JSON array — the POST did
+            # go out, so the outcome is unknown, not a local parse failure.
+            raise ReservationError("SUBMIT_OUTCOME_UNKNOWN", "提交请求已发出，但响应格式异常；请先在超星端核实")
         message = str(payload.get("msg") or payload.get("message") or "")
         success = payload.get("success")
         if success is True or (isinstance(success, str) and success.strip().lower() in {"true", "1"}):

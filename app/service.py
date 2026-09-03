@@ -392,11 +392,14 @@ def _load_fire_calibration(db) -> tuple[float, int]:
 def _record_accept_offset(db, offset: float) -> float | None:
     """Fold one observed fire→accept offset into the stored EMA.
 
-    Only genuine positive shifts teach the calibration (a negative or absurd
-    offset means the platform answered before our fire or something odd
-    happened); a calibration failure must never break the run itself.
+    Positive offsets (the platform kept answering 303 after our fire) push the
+    next fire later. An accept at-or-before our fire (offset <= 0 — e.g. the
+    platform switched to instant acceptance) pulls the EMA back DOWN, so a
+    stale offset can never keep later runs firing late forever; the 0.2s
+    safety lead keeps small noise inside a deadband. Absurd magnitudes are
+    rejected either way, and a calibration failure must never break the run.
     """
-    if not 0.0 < offset <= _CALIBRATION_MAX_SECONDS * 2:
+    if not -_CALIBRATION_MAX_SECONDS <= offset <= _CALIBRATION_MAX_SECONDS * 2:
         return None
     ema, samples = _load_fire_calibration(db)
     ema = offset if samples == 0 else ema + _CALIBRATION_ALPHA * (offset - ema)
@@ -579,6 +582,10 @@ def _parallel_opening_shot(
     # Seats whose POST is on the wire right now (guarded by ``guard``); the
     # post-deadline grace uses this to audit/verify stragglers.
     submitting: set[str] = set()
+    # Seats the parent shot already confirmed occupied (guarded by ``guard``);
+    # the seat's own racer checks this on wake-up so a dead seat never gets
+    # the extra staggered shot.
+    volley_dead: set[str] = set()
 
     def race(seat: str, racer: ChaoxingClient, index: int) -> None:
         nonlocal winner
@@ -598,6 +605,10 @@ def _parallel_opening_shot(
             return  # poller never saw the window; the serial fallback owns this
         if stop.is_set():
             return
+        with guard:
+            seat_already_dead = seat in volley_dead
+        if seat_already_dead:
+            return  # the parent shot already confirmed this seat occupied
         # Align with the platform's clock FIRST, resolve the page second. In
         # the true-race case the window only opens at/after the moment, so
         # this is timing-identical. But when the window is already open (a
@@ -626,8 +637,8 @@ def _parallel_opening_shot(
                         room_id, seat, target_day,
                         select_params=select_params, select_path=select_path, select_source=select_source,
                     )
-                except ReservationError:
-                    resolved = None
+                except Exception:
+                    resolved = None  # any surprise falls through to the cheaper paths
             if resolved is None:
                 try:
                     fast = racer.fetch_target_day_page(target_day, dict(verified_context), select_path)
@@ -641,7 +652,10 @@ def _parallel_opening_shot(
                         room_id, seat, target_day,
                         select_params=select_params, select_path=select_path, select_source=select_source,
                     )
-                except ReservationError:
+                except Exception:
+                    # ReservationError is the expected refusal; anything else
+                    # must still fall through instead of silently killing the
+                    # racer (its seat would vanish from the audit).
                     resolved = None
             if resolved is None:
                 # Last resort: the poller's page may still carry a usable token.
@@ -762,6 +776,9 @@ def _parallel_opening_shot(
                 "source": getattr(client, "last_parameter_source", "") or "unknown",
                 "timing": parent_timing,
             })
+            if exc.code == "SEAT_UNAVAILABLE":
+                with guard:
+                    volley_dead.add(workers[0])  # the seat's racer must not add a staggered shot
         else:
             parent_timing["submit_ms"] = round((time.monotonic() - parent_started) * 1000, 1)
             outcomes.append({"seat": workers[0], "code": None, "message": message, "submitted": True,
@@ -769,6 +786,12 @@ def _parallel_opening_shot(
                              "timing": parent_timing})
             winner = outcomes[-1]
             stop.set()
+    except BaseException:
+        # An unexpected parent-shot failure must stop the racers BEFORE they
+        # wake: this exception unwinds through execute_plan, which releases
+        # the account lock — no submit may outlive that (stop-first contract).
+        stop.set()
+        raise
     finally:
         opened.set()
     if winner is not None:
@@ -789,26 +812,27 @@ def _parallel_opening_shot(
             "volley outcomes: %s",
             "; ".join(f"{item['seat']}={item['code'] or 'SUCCESS'}" for item in outcomes),
         )
+    # No winner: nothing new may leave the wire after this point. A racer
+    # still mid-resolve (not yet in `submitting`) must not fire alongside —
+    # or after — the serial fallback, whose account lock must never shelter
+    # an unaccounted submit.
+    stop.set()
     with guard:
         stuck = sorted(submitting)
-    if stuck:
-        # A POST left the wire but never came back within the grace: stop the
-        # stragglers, audit the seats as outcome-unknown, and (when nobody
-        # won) hand the decision to the caller's existing server-verification
-        # branch — found becomes SUCCESS, unverifiable becomes
-        # NEEDS_VERIFICATION. Never a silent failure again.
-        stop.set()
         for seat in stuck:
             outcomes.append({
                 "seat": seat, "code": "SUBMIT_OUTCOME_UNKNOWN",
                 "message": "提交已发出但未在运行时限内返回；等待超星端核实",
                 "submitted": True, "source": "unknown",
             })
-        if winner is None:
-            # Verification needs live HTTP; the run deadline has passed. The
-            # serial fallback checks its own local deadline variable, so this
-            # extension cannot buy any extra submit.
-            client.deadline = time.monotonic() + VERIFY_BUDGET_SECONDS
+    if stuck:
+        # A POST left the wire but never came back within the grace: the
+        # caller's server-verification branch decides — found becomes
+        # SUCCESS, unverifiable becomes NEEDS_VERIFICATION. Verification needs
+        # live HTTP and the run deadline has passed; the serial fallback
+        # checks its own local deadline variable, so this extension cannot
+        # buy any extra submit.
+        client.deadline = time.monotonic() + VERIFY_BUDGET_SECONDS
     return outcomes, winner
 
 
@@ -1272,14 +1296,21 @@ def execute_plan(
             run.finished_at = datetime.now(dt.UTC).replace(tzinfo=None)
             if fire_epoch is not None and not probe_only:
                 # Fold "when did the platform first give a real answer" into
-                # the fire calibration (see problems.txt). Wrapped so a
-                # calibration hiccup can never break the run's own result.
+                # the fire calibration (see problems.txt). Only VOLLEY-phase
+                # attempts (parent shot / racers, marked by page_ms) count:
+                # serial attempts happen after our own back-off waits and
+                # would feed the EMA a positive feedback loop (every run
+                # later than the last). Wrapped so a calibration hiccup can
+                # never break the run's own result.
                 try:
                     accept_at = min(
                         (
                             item["timing"]["at"]
                             for item in run.attempt_details
-                            if isinstance(item.get("timing"), dict) and item.get("submitted") and item.get("code") in _ACCEPT_SIGNAL_CODES
+                            if isinstance(item.get("timing"), dict)
+                            and "page_ms" in item["timing"]
+                            and item.get("submitted")
+                            and item.get("code") in _ACCEPT_SIGNAL_CODES
                         ),
                         default=None,
                     )
