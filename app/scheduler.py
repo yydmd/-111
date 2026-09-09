@@ -9,7 +9,8 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select
 
 from .db import Account, ReservationPlan, ReservationRun, SessionLocal
-from .service import enqueue_plan
+from .service import enqueue_plan, _reservation_fingerprint
+from .run_state import ACTIVE_STATUSES
 
 logger = logging.getLogger(__name__)
 # A short wake-up delay should not throw away an opening-window reservation, but
@@ -19,18 +20,17 @@ STARTUP_CATCHUP_SECONDS = 90
 # Scheduled plans wake up this many seconds before their run time so login and
 # page warm-up finish before the platform's opening moment; the submit itself
 # still waits for the (server-aligned) run time inside the run.
-LEAD_SECONDS = 30
+LEAD_SECONDS = 600
 
 
 def _fire_time_of_day(run_time: str) -> tuple[int, int, int]:
     """Cron (hour, minute, second) that fires LEAD_SECONDS before run_time.
 
-    The one edge case is a run time inside the first half minute after
-    midnight: leading across the day boundary would shift the weekday, so we
-    clamp to firing exactly at 00:00:00 there.
+    Preparation may fall on the previous day; refresh_jobs shifts the cron
+    weekday accordingly while the run snapshot retains the opening day.
     """
     hour, minute = map(int, run_time.split(":", 1))
-    total = max(0, hour * 3600 + minute * 60 - LEAD_SECONDS)
+    total = (hour * 3600 + minute * 60 - LEAD_SECONDS) % 86400
     return total // 3600, (total % 3600) // 60, total % 60
 
 
@@ -48,6 +48,9 @@ def refresh_jobs() -> None:
                 logger.warning("Skipping plan %s because its run time is invalid", plan.id)
                 continue
             weekdays = ",".join(str(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].index(day)) for day in plan.weekdays if day in {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"})
+            hour, minute = map(int, plan.run_time.split(':'))
+            if hour * 3600 + minute * 60 < LEAD_SECONDS:
+                weekdays = ','.join(str((int(day) - 1) % 7) for day in weekdays.split(',') if day)
             if not weekdays:
                 continue
             scheduler.add_job(enqueue_plan, CronTrigger(day_of_week=weekdays, hour=fire_hour, minute=fire_minute, second=fire_second, timezone=ZoneInfo("Asia/Shanghai")), args=[plan.id, "scheduled"], id=f"plan-{plan.id}", replace_existing=True)
@@ -82,17 +85,20 @@ def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
     try:
         statement = select(ReservationPlan).join(Account).where(ReservationPlan.enabled.is_(True), Account.enabled.is_(True))
         for plan in db.scalars(statement):
-            if current.strftime("%A") not in plan.weekdays:
-                continue
             try:
-                fire_hour, fire_minute, fire_second = _fire_time_of_day(plan.run_time)
-                scheduled_at = current.replace(hour=fire_hour, minute=fire_minute, second=fire_second, microsecond=0)
+                hour, minute = map(int, plan.run_time.split(':'))
+                opening = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if 0 < (opening + dt.timedelta(days=1) - current).total_seconds() <= LEAD_SECONDS:
+                    opening += dt.timedelta(days=1)
+                scheduled_at = opening - dt.timedelta(seconds=LEAD_SECONDS)
             except ValueError:
                 continue
             delay = (current - scheduled_at).total_seconds()
-            if not 0 < delay <= STARTUP_CATCHUP_SECONDS:
+            if opening.strftime('%A') not in plan.weekdays or not 0 < delay <= LEAD_SECONDS + STARTUP_CATCHUP_SECONDS:
                 continue
-            target_date = (current.date() + dt.timedelta(days=plan.day_offset)).isoformat()
+            target_date = (opening.date() + dt.timedelta(days=plan.day_offset)).isoformat()
+            fingerprint = _reservation_fingerprint(
+                plan, opening.date() + dt.timedelta(days=plan.day_offset))
             # Only an IN-FLIGHT run (PENDING/RUNNING) or an already SUCCESSFUL
             # one for this plan+target-day counts as "already created".
             # Matching any historical row once swallowed this catch-up on
@@ -107,12 +113,25 @@ def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
                 select(ReservationRun.id).where(
                     ReservationRun.plan_id == plan.id,
                     ReservationRun.target_date == target_date,
+                    ReservationRun.request_fingerprint == fingerprint,
                     ReservationRun.trigger.in_(("scheduled", "scheduled_catchup")),
-                    ReservationRun.status.in_(("PENDING", "RUNNING", "SUCCESS")),
+                    ReservationRun.status.in_((*ACTIVE_STATUSES, "SUCCESS")),
                 ).limit(1)
             )
             if already_created:
                 logger.info("Plan %s fire moment just passed but run %s is already in flight; no catch-up needed", plan.id, already_created)
+                continue
+            unresolved = db.scalar(select(ReservationRun.id).where(
+                ReservationRun.account_id == plan.account_id,
+                ReservationRun.target_date == target_date,
+                ReservationRun.possibly_submitted.is_(True)).limit(1))
+            if unresolved:
+                continue
+            interrupted = db.scalar(select(ReservationRun.id).where(
+                ReservationRun.account_id == plan.account_id,
+                ReservationRun.target_date == target_date,
+                ReservationRun.error_code == "INTERRUPTED_NEEDS_VERIFICATION").limit(1))
+            if interrupted:
                 continue
             plan_ids.append(plan.id)
     finally:

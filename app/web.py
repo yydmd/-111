@@ -9,6 +9,8 @@ import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -22,8 +24,12 @@ from . import clock, notify
 from .db import Account, PlanSeat, ReservationPlan, ReservationRun, get_db, init_db
 from .scheduler import LEAD_SECONDS, _enqueue_recently_missed_jobs, refresh_jobs, scheduler, start_scheduler, stop_scheduler
 from .security import encrypt_password
-from .service import active_run_count, enqueue_plan, recover_interrupted_runs
+from .service import active_run_count, enqueue_plan, enqueue_login, recover_interrupted_runs
 from .validation import normalize_time, validate_reservation_time_range
+from .run_state import ACTIVE_STATUSES
+from . import browser_reserve
+from .browser_acceptance import acceptance as browser_acceptance
+from . import browser_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +66,18 @@ def _clock_warning() -> str | None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    recover_interrupted_runs()
+    recover_interrupted_runs(startup=True)
+    from .db import SessionLocal
+    with SessionLocal() as db:
+        for account in db.scalars(select(Account)):
+            account.login_status = 'UNKNOWN'
+            account.login_message = '服务已启动，请检查官方登录状态'
+        db.commit()
     clock.warm_start()
     start_scheduler()
     yield
+    browser_reserve.cancel_all()
+    browser_sessions.shutdown()
     stop_scheduler()
 
 
@@ -84,7 +98,7 @@ async def local_only(request: Request, call_next):
 class AccountIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     username: str = Field(min_length=1, max_length=255)
-    password: str = Field(min_length=1)
+    password: str = ""
     enabled: bool = True
 
 
@@ -105,6 +119,7 @@ class PlanData(BaseModel):
     day_offset: int = Field(default=1, ge=0, le=7)
     weekdays: list[str] = Field(default_factory=lambda: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"])
     slider_enabled: bool = False
+    execution_mode: Literal["api", "browser"] = "browser"
     # Risk-control cap: existing plans storing larger values are clamped here
     # and again at run time instead of being rejected. Since the no-repeat
     # rotation upgrade the budget equals distinct candidate seats tried.
@@ -207,13 +222,6 @@ class PlanData(BaseModel):
     @model_validator(mode="after")
     def validate_time_range(self) -> "PlanData":
         validate_reservation_time_range(self.start_time, self.end_time)
-        run_hour, run_minute = map(int, self.run_time.split(":", 1))
-        if run_hour == 0 and run_minute < 30:
-            # The scheduler wakes LEAD_SECONDS (30s) before run_time and clamps
-            # a wake-up that would cross midnight to 00:00:00; a run_time in
-            # 00:00–00:29 then wakes up to half an hour early and burns the
-            # 60-second run limit long before the opening moment.
-            raise ValueError("暂不支持 00:00–00:29 的执行时间（跨日提前唤醒会超出单次任务 60 秒运行上限）；请选择 00:30 及以后的时间")
         if len(self.seats) > self.max_attempts:
             raise ValueError("候选座位数不能超过总尝试次数；这样每个候选都能至少尝试一次")
         bound_room = str((self.select_params or {}).get("id", "")).strip()
@@ -248,6 +256,7 @@ def _plan_payload_from(plan: ReservationPlan) -> dict:
         "day_offset": plan.day_offset,
         "weekdays": plan.weekdays,
         "slider_enabled": plan.slider_enabled,
+        "execution_mode": plan.execution_mode or "api",
         "max_attempts": plan.max_attempts,
         "enabled": plan.enabled,
         "select_params": plan.select_params,
@@ -257,10 +266,12 @@ def _plan_payload_from(plan: ReservationPlan) -> dict:
 
 
 def _account_json(account: Account) -> dict:
-    return {"id": account.id, "name": account.name, "username": account.username, "enabled": account.enabled}
+    return {"id": account.id, "name": account.name, "username": account.username, "enabled": account.enabled,
+            "login_status": account.login_status or 'UNKNOWN', "login_message": account.login_message,
+            "login_checked_at": _utc_iso(account.login_checked_at)}
 
 
-def _next_run_at(plan: ReservationPlan) -> str | None:
+def _next_run_at(plan: ReservationPlan, now: dt.datetime | None = None) -> str | None:
     """The next real fire moment per the LIVE scheduler.
 
     The cron job wakes LEAD_SECONDS before run_time, so the reservation's own
@@ -270,6 +281,24 @@ def _next_run_at(plan: ReservationPlan) -> str | None:
     """
     if not plan.enabled or not scheduler.running:
         return None
+    # Cron wakes before the configured opening. If a plan is created or edited
+    # after that preparation point, its recurring cron occurrence is tomorrow,
+    # while the catch-up task is correctly handling today's still-current
+    # opening. Show that real current occurrence instead of lying that the next
+    # reservation is tomorrow.
+    current = now or dt.datetime.now(ZoneInfo("Asia/Shanghai"))
+    try:
+        hour, minute = map(int, plan.run_time.split(":", 1))
+        opening = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        awaiting_current_opening = (
+            opening.strftime("%A") in plan.weekdays
+            and opening - dt.timedelta(seconds=LEAD_SECONDS) <= current
+            <= opening
+        )
+        if awaiting_current_opening:
+            return opening.isoformat()
+    except (AttributeError, TypeError, ValueError):
+        pass
     try:
         job = scheduler.get_job(f"plan-{plan.id}")
     except Exception:
@@ -292,6 +321,7 @@ def _plan_json(plan: ReservationPlan) -> dict:
         "day_offset": plan.day_offset,
         "weekdays": plan.weekdays,
         "slider_enabled": plan.slider_enabled,
+        "execution_mode": plan.execution_mode or "api",
         "max_attempts": plan.max_attempts,
         "enabled": plan.enabled,
         "select_params": plan.select_params,
@@ -332,6 +362,7 @@ def _apply_plan_data(plan: ReservationPlan, data: PlanData, provided: set[str] |
     plan.day_offset = data.day_offset
     plan.weekdays_json = json.dumps(data.weekdays)
     plan.slider_enabled = data.slider_enabled
+    plan.execution_mode = 'browser'
     plan.max_attempts = data.max_attempts
     plan.enabled = data.enabled
     if full_replace or any(field in provided for field in _SELECT_CONTEXT_FIELDS):
@@ -349,7 +380,7 @@ def _apply_plan_data(plan: ReservationPlan, data: PlanData, provided: set[str] |
 def _refresh_jobs_and_catch_up() -> None:
     """Refresh cron jobs, then catch a run whose fire moment just passed.
 
-    A plan saved after its (run_time - 30s) wake-up moment would otherwise be
+    A plan saved after its configured preparation wake-up moment would otherwise be
     silently scheduled for tomorrow; apply the same recently-missed catch-up
     the service uses at startup (dedup lives in the durable run table).
     """
@@ -437,6 +468,25 @@ def create_account(data: AccountIn, db: Session = Depends(get_db)):
     return _account_json(account)
 
 
+@app.get('/api/accounts/{account_id}/login-status')
+def account_login_status(account_id: int, db: Session = Depends(get_db)):
+    account = db.get(Account, account_id)
+    if not account:
+        raise HTTPException(404, '账号不存在')
+    active = db.scalar(select(ReservationRun).where(ReservationRun.account_id == account_id,
+                       ReservationRun.status.in_(ACTIVE_STATUSES)).order_by(ReservationRun.id))
+    return {**_account_json(account), 'run_id': active.id if active else None,
+            'active_status': active.status if active else None}
+
+
+@app.post('/api/accounts/{account_id}/check-login')
+def check_account_login(account_id: int):
+    try:
+        return {'accepted':True, 'run_id':enqueue_login(account_id)}
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @app.delete("/api/accounts/{account_id}")
 def delete_account(account_id: int, db: Session = Depends(get_db)):
     account = db.get(Account, account_id)
@@ -444,6 +494,7 @@ def delete_account(account_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "账号不存在")
     db.delete(account)
     db.commit()
+    browser_sessions.close_account(account_id)
     refresh_jobs()
     return {"ok": True}
 
@@ -453,14 +504,20 @@ def patch_account(account_id: int, data: AccountPatch, db: Session = Depends(get
     account = db.get(Account, account_id)
     if not account:
         raise HTTPException(404, "账号不存在")
+    was_enabled = bool(account.enabled)
     if data.name is not None:
         account.name = data.name
     if data.password is not None:
         account.password_blob = encrypt_password(data.password)
     if data.enabled is not None:
         account.enabled = data.enabled
+        if not data.enabled:
+            browser_sessions.close_account(account_id)
     db.commit()
-    refresh_jobs()
+    if data.enabled is True and not was_enabled:
+        _refresh_jobs_and_catch_up()
+    else:
+        refresh_jobs()
     return _account_json(account)
 
 
@@ -503,6 +560,8 @@ def patch_plan(plan_id: int, payload: dict, db: Session = Depends(get_db)):
         raise HTTPException(422, "；".join(filter(None, (str(error.get("msg") or "") for error in exc.errors())))) from exc
     if not db.get(Account, data.account_id):
         raise HTTPException(404, "账号不存在")
+    if data.account_id != plan.account_id or data.execution_mode != (plan.execution_mode or "api"):
+        _reject_if_account_busy(db, plan)
     _apply_plan_data(plan, data, provided=set(payload.keys()))
     db.commit()
     db.refresh(plan)
@@ -531,11 +590,93 @@ def _reject_if_account_busy(db: Session, plan: ReservationPlan) -> None:
     active = db.scalar(
         select(ReservationRun.id).where(
             ReservationRun.account_id == plan.account_id,
-            ReservationRun.status.in_(("PENDING", "RUNNING")),
+            ReservationRun.status.in_(ACTIVE_STATUSES),
         ).limit(1)
     )
     if active:
         raise HTTPException(409, "该账号已有任务在排队或执行中，请等待完成后再试")
+
+
+@app.get("/api/browser/status")
+def browser_status():
+    return browser_reserve.readiness()
+
+
+@app.get("/api/browser/acceptance")
+def browser_acceptance_status(db: Session = Depends(get_db)):
+    return browser_acceptance(db)
+
+
+@app.post("/api/plans/{plan_id}/browser-trial")
+def trial_browser(plan_id: int, db: Session = Depends(get_db)):
+    plan = db.get(ReservationPlan, plan_id)
+    if not plan:
+        raise HTTPException(404, "计划不存在")
+    _reject_if_account_busy(db, plan)
+    result = browser_acceptance(db, plan)
+    if not result["can_trial"]:
+        raise HTTPException(409, result["message"])
+    return {"accepted": True, "run_id": enqueue_plan(plan.id, "browser_trial")}
+
+
+@app.post("/api/plans/{plan_id}/browser-enable")
+def enable_browser(plan_id: int, db: Session = Depends(get_db)):
+    plan = db.get(ReservationPlan, plan_id)
+    if not plan:
+        raise HTTPException(404, "计划不存在")
+    _reject_if_account_busy(db, plan)
+    result = browser_acceptance(db, plan)
+    if not result["can_enable"]:
+        raise HTTPException(409, result["message"])
+    plan.execution_mode = "browser"
+    db.commit()
+    refresh_jobs()
+    return {"accepted": True, "execution_mode": "browser"}
+
+
+@app.post("/api/plans/{plan_id}/browser-preview")
+def preview_browser(plan_id: int, db: Session = Depends(get_db)):
+    plan = db.get(ReservationPlan, plan_id)
+    if not plan:
+        raise HTTPException(404, "计划不存在")
+    _reject_if_account_busy(db, plan)
+    return {"accepted": True, "run_id": enqueue_plan(plan.id, "browser_preview")}
+
+
+def _browser_command(run_id, action, db):
+    run = db.get(ReservationRun, run_id)
+    if not run:
+        raise HTTPException(404, "运行记录不存在")
+    if run.status not in ACTIVE_STATUSES or not browser_reserve.command(run_id, action):
+        raise HTTPException(409, "浏览器任务尚未启动或已经结束")
+    return {"accepted": True}
+
+
+@app.post("/api/runs/{run_id}/browser-focus")
+def focus_browser(run_id: int, db: Session = Depends(get_db)):
+    return _browser_command(run_id, "focus", db)
+
+
+@app.post("/api/runs/{run_id}/browser-cancel")
+def cancel_browser(run_id: int, db: Session = Depends(get_db)):
+    return _browser_command(run_id, "cancel", db)
+
+
+@app.post("/api/runs/{run_id}/browser-confirm-account")
+def confirm_browser_account(run_id: int, db: Session = Depends(get_db)):
+    return _browser_command(run_id, "confirm_account", db)
+
+
+@app.post("/api/runs/{run_id}/browser-recheck")
+def recheck_browser(run_id: int, db: Session = Depends(get_db)):
+    run = db.get(ReservationRun, run_id)
+    if not run or not run.plan_id:
+        raise HTTPException(404, "原任务或计划不存在")
+    plan = db.get(ReservationPlan, run.plan_id)
+    if not plan or plan.account_id != run.account_id:
+        raise HTTPException(409, "原计划账号已经变更，无法使用此窗口核对")
+    _reject_if_account_busy(db, plan)
+    return {"accepted": True, "run_id": enqueue_plan(plan.id, "browser_recheck", duplicate_of_run_id=run.id)}
 
 
 @app.post("/api/plans/{plan_id}/probe")
@@ -624,6 +765,10 @@ def _run_json(run: ReservationRun) -> dict:
         "attempt_details": run.attempt_details,
         "started_at": _utc_iso(run.started_at),
         "finished_at": _utc_iso(run.finished_at),
+        "heartbeat_at": _utc_iso(run.heartbeat_at),
+        "expires_at": _utc_iso(run.expires_at),
+        "possibly_submitted": bool(run.possibly_submitted),
+        "execution_mode": run.request_snapshot.get("execution_mode", "api"),
     }
 
 

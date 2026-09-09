@@ -19,6 +19,7 @@ from .notify import submit_async as notify_async
 from .db import Account, AppSetting, ReservationPlan, ReservationRun, SessionLocal
 from .security import decrypt_password, redact
 from .validation import normalize_time, validate_reservation_time_range
+from .run_state import ACTIVE_STATUSES, BROWSER_RUN_SECONDS, live_browser_run
 
 logger = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -103,6 +104,7 @@ _NOTIFY_STATUSES = {"SUCCESS", "FAILED", "SKIPPED", "NEEDS_VERIFICATION", "BLOCK
 _executor = ThreadPoolExecutor(max_workers=MAX_ACCOUNT_WORKERS, thread_name_prefix="reserve")
 _account_locks: dict[int, threading.Lock] = {}
 _account_locks_guard = threading.Lock()
+_enqueue_guard = threading.Lock()
 
 
 def now_shanghai() -> dt.datetime:
@@ -140,6 +142,12 @@ def _target_page_is_expected_to_wait(plan: ReservationPlan, target_day: dt.date,
 
 def _run_snapshot(plan: ReservationPlan, trigger: str) -> ReservationRun:
     target_day = _target_day(plan)
+    opening = _opening_at(plan)
+    if trigger in {'scheduled', 'scheduled_catchup'} and opening:
+        current = now_shanghai()
+        if opening < current and 0 <= (opening + dt.timedelta(days=1) - current).total_seconds() <= 600:
+            opening += dt.timedelta(days=1)
+        target_day = opening.date() + dt.timedelta(days=plan.day_offset)
     request_snapshot = {
         "room_id": plan.room_id.strip(),
         "start_time": normalize_time(plan.start_time),
@@ -148,6 +156,12 @@ def _run_snapshot(plan: ReservationPlan, trigger: str) -> ReservationRun:
         "select_params": plan.select_params,
         "select_context_path": plan.select_context_path,
         "select_context_source": plan.select_context_source,
+        "execution_mode": "browser" if trigger in {"browser_preview", "browser_recheck", "browser_trial"} else (plan.execution_mode or "api"),
+        "run_time": plan.run_time,
+        "day_offset": plan.day_offset,
+        "weekdays": plan.weekdays,
+        "opening_at": opening.isoformat() if trigger in {"scheduled", "scheduled_catchup"} and opening else None,
+        "max_attempts": min(plan.max_attempts, MAX_SUBMIT_ATTEMPTS),
     }
     return ReservationRun(
         plan_id=plan.id,
@@ -178,21 +192,122 @@ def enqueue_plan(
     duplicate_of_run_id: int | None = None,
 ) -> int:
     """Create a durable pending run then hand it to the bounded local worker pool."""
-    db = SessionLocal()
-    try:
-        plan = db.get(ReservationPlan, plan_id)
-        if not plan:
-            raise ValueError("plan not found")
-        run = _run_snapshot(plan, trigger)
-        run.duplicate_override = override_duplicate
-        run.duplicate_of_run_id = duplicate_of_run_id
-        db.add(run)
-        db.commit()
-        run_id = run.id
-    finally:
-        db.close()
-    _executor.submit(execute_plan, plan_id, trigger, probe_only=probe_only, run_id=run_id, override_duplicate=override_duplicate)
+    with _enqueue_guard:
+        db = SessionLocal()
+        try:
+            plan = db.get(ReservationPlan, plan_id)
+            if not plan:
+                raise ValueError("plan not found")
+            # A scheduler/API race must not queue another run behind a human
+            # who is still completing verification for this account.
+            active_runs = db.scalars(select(ReservationRun).where(
+                ReservationRun.account_id == plan.account_id,
+                ReservationRun.status.in_(ACTIVE_STATUSES))).all()
+            run = _run_snapshot(plan, trigger)
+            for active in active_runs:
+                if active.trigger != 'account_login' and active.plan_id == plan.id and active.target_date == run.target_date and (
+                        active.trigger == trigger or trigger in {'scheduled', 'scheduled_catchup'}):
+                    return active.id
+            if not probe_only:
+                snapshot = run.request_snapshot
+                snapshot["execution_mode"] = "browser"
+                run.request_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
+            if trigger == "browser_recheck" and duplicate_of_run_id:
+                original = db.get(ReservationRun, duplicate_of_run_id)
+                if not original or original.account_id != plan.account_id:
+                    raise ValueError("原任务账号与计划不一致")
+                snapshot = original.request_snapshot
+                snapshot["execution_mode"] = "browser"
+                run.request_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
+                run.target_date = original.target_date
+                run.request_fingerprint = original.request_fingerprint
+                run.candidate_seats_json = original.candidate_seats_json
+            run.duplicate_override = override_duplicate
+            run.duplicate_of_run_id = duplicate_of_run_id
+            db.add(run)
+            db.commit()
+            run_id = run.id
+        finally:
+            db.close()
+    if probe_only:
+        _executor.submit(execute_plan, plan_id, trigger, probe_only=True, run_id=run_id, override_duplicate=override_duplicate)
+    else:
+        from .browser_sessions import submit
+        submit(run.account_id, execute_plan, plan_id, trigger, run_id=run_id, override_duplicate=override_duplicate)
     return run_id
+
+
+def enqueue_login(account_id):
+    from .browser_sessions import submit
+    with _enqueue_guard:
+        with SessionLocal() as db:
+            account = db.get(Account, account_id)
+            if not account or not account.enabled:
+                raise ValueError('账号不存在或已停用')
+            active = db.scalar(select(ReservationRun).where(ReservationRun.account_id == account_id,
+                               ReservationRun.status.in_(ACTIVE_STATUSES)).order_by(ReservationRun.id))
+            if active:
+                from .browser_reserve import command
+                command(active.id, 'focus')
+                return active.id
+            run = ReservationRun(account_id=account_id, account_name=account.name, plan_name='账号登录检查',
+                                 trigger='account_login', status='PENDING', message='等待检查官方登录状态',
+                                 request_snapshot_json='{"execution_mode":"browser"}')
+            db.add(run)
+            account.login_status = 'CHECKING'
+            db.commit()
+            run_id = run.id
+    submit(account_id, execute_login, run_id)
+    return run_id
+
+
+def execute_login(run_id):
+    from .browser_reserve import run_browser
+    with SessionLocal() as db:
+        run = db.get(ReservationRun, run_id)
+        account = db.get(Account, run.account_id)
+        if not account or not account.enabled:
+            run.status, run.error_code = 'SKIPPED', 'PLAN_OR_ACCOUNT_DISABLED'
+            run.finished_at = datetime.now(dt.UTC).replace(tzinfo=None)
+            db.commit()
+            return
+        with _account_lock(account.id):
+            run.expires_at = datetime.now(dt.UTC).replace(tzinfo=None) + dt.timedelta(seconds=300)
+            db.commit()
+            notified = set()
+            def checkpoint(status, message, submitted, seat=None):
+                if not db.scalar(select(Account.enabled).where(Account.id == account.id)):
+                    db.commit()
+                    return False
+                run.status, run.message = status, redact(message)
+                run.heartbeat_at = datetime.now(dt.UTC).replace(tzinfo=None)
+                account.login_status = 'WAITING_LOGIN' if status == 'WAITING_LOGIN' else 'CHECKING'
+                if message == '官方已确认登录有效':
+                    account.login_status = 'READY'
+                    account.login_checked_at = run.heartbeat_at
+                account.login_message = redact(message)
+                db.commit()
+                if status in {'WAITING_LOGIN', 'WAITING_USER'} and status not in notified:
+                    notified.add(status)
+                    try:
+                        import winsound
+                        winsound.PlaySound('SystemExclamation', winsound.SND_ALIAS | winsound.SND_ASYNC)
+                    except (ImportError, RuntimeError):
+                        pass
+                return True
+            try:
+                result = run_browser(run.id, account.id, {'username':account.username, 'seats':[]}, None,
+                                     app_clock.server_now(), checkpoint, login_only=True)
+                run.status, run.error_code, run.message = result.status, result.code, redact(result.message)
+                account.login_status = 'READY' if result.code == 'LOGIN_READY' else 'UNKNOWN' if result.code == 'BROWSER_CANCELLED' else 'ERROR'
+                account.login_message = run.message
+            except Exception:
+                run.status, run.error_code, run.message = 'NEEDS_VERIFICATION', 'LOGIN_CHECK_FAILED', '登录检查中断，请重试'
+                account.login_status = 'ERROR'
+                account.login_message = run.message
+            finally:
+                run.finished_at = datetime.now(dt.UTC).replace(tzinfo=None)
+                db.commit()
 
 
 def _set_failure(run: ReservationRun, code: str, message: str, *, status: str = "FAILED") -> None:
@@ -836,7 +951,7 @@ def _parallel_opening_shot(
     return outcomes, winner
 
 
-def recover_interrupted_runs() -> int:
+def recover_interrupted_runs(*, startup: bool = False) -> int:
     """Mark stale durable work for review instead of blindly re-submitting it.
 
     An external reservation can succeed just before a local process crashes, so
@@ -847,11 +962,14 @@ def recover_interrupted_runs() -> int:
         cutoff = datetime.now(dt.UTC).replace(tzinfo=None) - dt.timedelta(seconds=RUN_LIMIT_SECONDS + 15)
         stale = db.scalars(
             select(ReservationRun).where(
-                ReservationRun.status.in_(("PENDING", "RUNNING")),
-                ReservationRun.started_at < cutoff,
+                ReservationRun.status.in_(ACTIVE_STATUSES),
             )
         ).all()
         now = datetime.now(dt.UTC).replace(tzinfo=None)
+        from .browser_sessions import owns_account
+        stale = [run for run in stale if startup or
+                 (not (run.status == 'PENDING' and owns_account(run.account_id)) and
+                  not live_browser_run(run.heartbeat_at, run.expires_at, now) and run.started_at < cutoff)]
         for run in stale:
             run.status = "NEEDS_VERIFICATION"
             run.error_code = "INTERRUPTED_NEEDS_VERIFICATION"
@@ -867,7 +985,7 @@ def active_run_count() -> int:
     db = SessionLocal()
     try:
         return int(
-            db.scalar(select(__import__("sqlalchemy").func.count()).select_from(ReservationRun).where(ReservationRun.status.in_(("PENDING", "RUNNING"))))
+            db.scalar(select(__import__("sqlalchemy").func.count()).select_from(ReservationRun).where(ReservationRun.status.in_(ACTIVE_STATUSES)))
             or 0
         )
     finally:
@@ -891,6 +1009,10 @@ def _request_values(plan: ReservationPlan, run: ReservationRun) -> dict:
             "select_params": params if isinstance(params, dict) and params else None,
             "select_context_path": snapshot.get("select_context_path") or None,
             "select_context_source": snapshot.get("select_context_source") or None,
+            "execution_mode": snapshot.get("execution_mode", "api"),
+            "run_time": snapshot.get("run_time", plan.run_time),
+            "weekdays": snapshot.get("weekdays", plan.weekdays),
+            "max_attempts": snapshot.get("max_attempts", min(plan.max_attempts, MAX_SUBMIT_ATTEMPTS)),
         }
     return {
         "room_id": plan.room_id,
@@ -900,7 +1022,122 @@ def _request_values(plan: ReservationPlan, run: ReservationRun) -> dict:
         "select_params": plan.select_params,
         "select_context_path": plan.select_context_path,
         "select_context_source": plan.select_context_source,
+        "execution_mode": plan.execution_mode or "api",
+        "run_time": plan.run_time,
+        "weekdays": plan.weekdays,
+        "max_attempts": min(plan.max_attempts, MAX_SUBMIT_ATTEMPTS),
     }
+
+
+def _execute_browser(db, plan, account, run, values):
+    from .browser_reserve import BrowserResult, run_browser
+    preview = run.trigger == "browser_preview"
+    check_only = run.trigger == "browser_recheck"
+    fire_epoch = app_clock.server_now()
+    if run.trigger in {"scheduled", "scheduled_catchup"}:
+        hour, minute = map(int, values["run_time"].split(":"))
+        opening_at = run.request_snapshot.get("opening_at")
+        created_day = run.started_at.replace(tzinfo=dt.UTC).astimezone(now_shanghai().tzinfo)
+        fire_epoch = (datetime.fromisoformat(opening_at).timestamp() if opening_at else
+                      created_day.replace(hour=hour, minute=minute, second=0, microsecond=0).timestamp())
+    remaining = max(0, fire_epoch + BROWSER_RUN_SECONDS - app_clock.server_now())
+    run.expires_at = datetime.now(dt.UTC).replace(tzinfo=None) + dt.timedelta(seconds=remaining)
+    run.parameter_source = "browser"
+    run.status = "RUNNING"
+    run.heartbeat_at = datetime.now(dt.UTC).replace(tzinfo=None)
+    db.commit()
+    last_commit = 0.0
+    notified = set()
+
+    def checkpoint(status, message, submitted, seat=None):
+        nonlocal last_commit
+        current = time.monotonic()
+        changed = run.status != status or run.message != message or submitted is not None
+        if changed or current - last_commit >= 2:
+            # Fresh short reads; no transaction is held during human waiting.
+            enabled = db.scalar(select(Account.enabled).where(Account.id == account.id))
+            plan_enabled = db.scalar(select(ReservationPlan.enabled).where(ReservationPlan.id == plan.id))
+            allowed = bool(enabled) and plan_enabled is not None and (
+                run.trigger not in {"scheduled", "scheduled_catchup"} or bool(plan_enabled))
+            if not allowed:
+                run.heartbeat_at = datetime.now(dt.UTC).replace(tzinfo=None)
+                db.commit()
+                return False
+            run.status, run.message = status, redact(message)
+            run.heartbeat_at = datetime.now(dt.UTC).replace(tzinfo=None)
+            if submitted is not None:
+                run.possibly_submitted = submitted
+            if message == '官方已确认登录有效':
+                account.login_status = 'READY'
+                account.login_checked_at = run.heartbeat_at
+                account.login_message = message
+            elif status == 'WAITING_LOGIN':
+                account.login_status = 'WAITING_LOGIN'
+                account.login_message = message
+            if submitted is True and seat:
+                run.selected_seat = seat
+                _append_attempt(run, seat=seat, source="browser", submitted=True,
+                                code="SUBMIT_OUTCOME_UNKNOWN", message="请求已放行，等待官方结果")
+            elif submitted is False and run.attempt_details:
+                details = run.attempt_details
+                details[-1]["code"] = "SEAT_UNAVAILABLE" if status == "RUNNING" else None
+                details[-1]["message"] = redact(message)
+                run.attempt_details_json = json.dumps(details, ensure_ascii=False)
+            db.commit()
+            last_commit = current
+            if status in {"WAITING_USER", "WAITING_LOGIN"} and status not in notified:
+                notified.add(status)
+                try:
+                    import winsound
+                    winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                except (ImportError, RuntimeError):
+                    pass
+                if not preview and not check_only:
+                    notify_async(f"预约需要操作：{run.plan_name}", f"账号 {run.account_name}；{message}")
+        return True
+
+    browser_values = {**values, "username": account.username}
+    outcome = run_browser(run.id, account.id, browser_values, run.target_date, fire_epoch, checkpoint,
+                          preview=preview, check_only=check_only)
+    # Before any request is released, an accidentally closed/crashed browser
+    # is safe to rebuild. Retry once with the same immutable run snapshot and
+    # account profile; a second closure remains terminal, and an explicit
+    # cancel or any possibly-submitted request is never replayed.
+    if (not preview and not check_only
+            and outcome.code == "BROWSER_WINDOW_CLOSED"
+            and not run.possibly_submitted
+            and app_clock.server_now() < fire_epoch + BROWSER_RUN_SECONDS):
+        if checkpoint("RUNNING", "预约窗口意外关闭，正在自动恢复一次", False):
+            outcome = run_browser(run.id, account.id, browser_values, run.target_date, fire_epoch, checkpoint,
+                                  preview=False, check_only=False)
+        else:
+            outcome = BrowserResult("SKIPPED", "PLAN_OR_ACCOUNT_DISABLED",
+                                    "计划或账号已停用，未恢复预约窗口")
+    run.status, run.error_code, run.message = outcome.status, outcome.code, redact(outcome.message)
+    run.selected_seat = outcome.seat or run.selected_seat
+    if check_only and outcome.code in {"BROWSER_CHECK_EXACT", "BROWSER_CHECK_ABSENT"}:
+        unresolved = db.scalars(select(ReservationRun).where(
+            ReservationRun.account_id == run.account_id,
+            ReservationRun.request_fingerprint == run.request_fingerprint,
+            ReservationRun.possibly_submitted.is_(True))).all()
+        for old in unresolved:
+            # The fingerprint deliberately groups the same account/date/room/
+            # interval and excludes candidate seats. An exact recheck only
+            # proves runs whose own candidate set contains the held seat.
+            if (outcome.code == "BROWSER_CHECK_EXACT" and
+                    outcome.seat not in old.candidate_seats):
+                continue
+            old.possibly_submitted = False
+            if outcome.code == "BROWSER_CHECK_EXACT":
+                old.status = "SUCCESS"
+                old.error_code = None
+                old.selected_seat = outcome.seat or old.selected_seat
+                old.message = f"{outcome.message}；已通过只读核对任务 #{run.id} 确认预约成功"
+            else:
+                old.message += f"；已通过只读核对任务 #{run.id} 解决未知提交状态"
+    if not run.attempt_details:
+        _append_attempt(run, seat=outcome.seat or "-", source="browser", submitted=bool(run.possibly_submitted),
+                        code=outcome.code, message=outcome.message)
 
 
 def execute_plan(
@@ -944,10 +1181,16 @@ def execute_plan(
             _set_failure(run, "PLAN_OR_ACCOUNT_DISABLED", "计划或账号已停用")
             return run.id
         request_values = _request_values(plan, run)
+        # Both entry points (queued and synchronous) must enforce read-only
+        # browser operations regardless of the plan's saved execution mode.
+        if trigger in {"browser_preview", "browser_recheck", "browser_trial"}:
+            request_values["execution_mode"] = "browser"
         if not request_values["seats"]:
             _set_failure(run, "NO_CANDIDATE_SEAT", "未配置候选座位")
             return run.id
-        if trigger in {"scheduled", "scheduled_catchup"} and not _today_enabled(plan):
+        opening = run.request_snapshot.get('opening_at')
+        weekday = datetime.fromisoformat(opening).strftime('%A') if opening else now_shanghai().strftime('%A')
+        if trigger in {"scheduled", "scheduled_catchup"} and weekday not in request_values["weekdays"]:
             _set_failure(run, "WEEKDAY_NOT_ENABLED", "今天不在该计划的执行星期内")
             return run.id
         if not probe_only:
@@ -961,6 +1204,18 @@ def execute_plan(
         lock_acquired = lock.acquire(timeout=max(0, remaining))
         if not lock_acquired:
             _set_failure(run, "ACCOUNT_BUSY_TIMEOUT", "同一账号的前一个任务在 60 秒内未结束")
+            return run.id
+        if not probe_only and trigger not in {"browser_preview", "browser_recheck"}:
+            unresolved = db.scalar(select(ReservationRun.id).where(
+                ReservationRun.id != run.id,
+                ReservationRun.account_id == run.account_id,
+                ReservationRun.request_fingerprint == run.request_fingerprint,
+                ReservationRun.possibly_submitted.is_(True)).limit(1))
+            if unresolved:
+                _set_failure(run, "UNRESOLVED_SUBMISSION", f"任务 #{unresolved} 的提交结果尚未核实，请先使用原任务的只读核对", status="NEEDS_VERIFICATION")
+                return run.id
+        if request_values["execution_mode"] == "browser" and not probe_only:
+            _execute_browser(db, plan, account, run, request_values)
             return run.id
         client = ChaoxingClient(
             account.username,
@@ -1290,37 +1545,39 @@ def execute_plan(
         _set_failure(run, "UNEXPECTED_ERROR", str(exc))
         return run.id
     finally:
-        if lock is not None and lock_acquired:
-            lock.release()
-        if run is not None:
-            run.finished_at = datetime.now(dt.UTC).replace(tzinfo=None)
-            if fire_epoch is not None and not probe_only:
-                # Fold "when did the platform first give a real answer" into
-                # the fire calibration (see problems.txt). Only VOLLEY-phase
-                # attempts (parent shot / racers, marked by page_ms) count:
-                # serial attempts happen after our own back-off waits and
-                # would feed the EMA a positive feedback loop (every run
-                # later than the last). Wrapped so a calibration hiccup can
-                # never break the run's own result.
-                try:
-                    accept_at = min(
-                        (
-                            item["timing"]["at"]
-                            for item in run.attempt_details
-                            if isinstance(item.get("timing"), dict)
-                            and "page_ms" in item["timing"]
-                            and item.get("submitted")
-                            and item.get("code") in _ACCEPT_SIGNAL_CODES
-                        ),
-                        default=None,
-                    )
-                    if accept_at is not None:
-                        _record_accept_offset(db, accept_at - fire_epoch)
-                except Exception:
-                    logger.debug("fire calibration update failed", exc_info=True)
-            db.commit()
-            if run.status in _NOTIFY_STATUSES and run.trigger not in {"probe", "discover"}:
-                title = f"抢座 {run.status}：{run.plan_name or run.plan_id or ''} {run.target_date or ''}".strip()
-                body = f"账号 {run.account_name or '-'}；座位 {run.selected_seat or '、'.join(run.candidate_seats) or '-'}\n{run.message or ''}"
-                notify_async(title, body)
-        db.close()
+        try:
+            if run is not None:
+                run.finished_at = datetime.now(dt.UTC).replace(tzinfo=None)
+                if fire_epoch is not None and not probe_only:
+                    # Fold "when did the platform first give a real answer" into
+                    # the fire calibration (see problems.txt). Only VOLLEY-phase
+                    # attempts (parent shot / racers, marked by page_ms) count:
+                    # serial attempts happen after our own back-off waits and
+                    # would feed the EMA a positive feedback loop (every run
+                    # later than the last). Wrapped so a calibration hiccup can
+                    # never break the run's own result.
+                    try:
+                        accept_at = min(
+                            (
+                                item["timing"]["at"]
+                                for item in run.attempt_details
+                                if isinstance(item.get("timing"), dict)
+                                and "page_ms" in item["timing"]
+                                and item.get("submitted")
+                                and item.get("code") in _ACCEPT_SIGNAL_CODES
+                            ),
+                            default=None,
+                        )
+                        if accept_at is not None:
+                            _record_accept_offset(db, accept_at - fire_epoch)
+                    except Exception:
+                        logger.debug("fire calibration update failed", exc_info=True)
+                db.commit()
+                if run.status in _NOTIFY_STATUSES and run.trigger not in {"probe", "discover", "browser_preview", "browser_recheck"}:
+                    title = f"抢座 {run.status}：{run.plan_name or run.plan_id or ''} {run.target_date or ''}".strip()
+                    body = f"账号 {run.account_name or '-'}；座位 {run.selected_seat or '、'.join(run.candidate_seats) or '-'}\n{run.message or ''}"
+                    notify_async(title, body)
+        finally:
+            db.close()
+            if lock is not None and lock_acquired:
+                lock.release()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,7 +16,7 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DATABASE_PATH = DATA_DIR / "app.db"
 DATABASE_URL = f"sqlite:///{DATABASE_PATH.as_posix()}"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 _SELECT_CONTEXT_PATH_RE = re.compile(r"/front/(?:third/)?apps/seat/select", re.I)
 
 
@@ -38,6 +37,9 @@ class Account(Base):
     username: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     password_blob: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    login_status: Mapped[str] = mapped_column(String(32), default="UNKNOWN", nullable=False)
+    login_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    login_message: Mapped[str] = mapped_column(Text, default="尚未检查登录", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     plans: Mapped[list["ReservationPlan"]] = relationship(back_populates="account", cascade="all, delete-orphan")
 
@@ -56,6 +58,7 @@ class ReservationPlan(Base):
     day_offset: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     weekdays_json: Mapped[str] = mapped_column(Text, default='["Monday","Tuesday","Wednesday","Thursday","Friday"]', nullable=False)
     slider_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    execution_mode: Mapped[str] = mapped_column(String(16), default="browser", nullable=False)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Sanitized stable query params for the seat-select page (without ephemeral
@@ -130,6 +133,9 @@ class ReservationRun(Base):
     request_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    possibly_submitted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     @property
     def candidate_seats(self) -> list[str]:
@@ -187,7 +193,9 @@ def _backup_database() -> None:
     backup_dir = DATA_DIR / "backups"
     backup_dir.mkdir(exist_ok=True)
     backup_path = backup_dir / f"app-before-v{SCHEMA_VERSION}-{datetime.now():%Y%m%d-%H%M%S}.db"
-    shutil.copy2(DATABASE_PATH, backup_path)
+    # SQLite backup includes committed WAL pages; copying only app.db does not.
+    with sqlite3.connect(DATABASE_PATH) as source, sqlite3.connect(backup_path) as target:
+        source.backup(target)
 
 
 def _schema_version(connection: sqlite3.Connection) -> int:
@@ -277,6 +285,10 @@ def _migrate_database() -> None:
                         "UPDATE reservation_plans SET select_context_path=? WHERE id=?",
                         (canonical_path, plan_id),
                     )
+            version = 9
+        if version in {9, 10}:
+            _add_browser_columns(connection)
+            _add_login_columns(connection)
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             connection.commit()
             return
@@ -377,6 +389,8 @@ def _migrate_database() -> None:
         connection.execute("ALTER TABLE reservation_runs ADD COLUMN attempt_details_json TEXT")
         connection.execute("ALTER TABLE reservation_plans ADD COLUMN select_context_path VARCHAR(255)")
         connection.execute("ALTER TABLE reservation_runs ADD COLUMN request_snapshot_json TEXT")
+        _add_browser_columns(connection)
+        _add_login_columns(connection)
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
     except Exception:
@@ -384,6 +398,32 @@ def _migrate_database() -> None:
         raise
     finally:
         connection.close()
+
+
+def _add_login_columns(connection) -> None:
+    existing = {row[1] for row in connection.execute('PRAGMA table_info(accounts)')}
+    if existing:
+        for name, spec in {'login_status': "VARCHAR(32) NOT NULL DEFAULT 'UNKNOWN'",
+                           'login_checked_at': 'DATETIME',
+                           'login_message': "TEXT NOT NULL DEFAULT '尚未检查登录'"}.items():
+            if name not in existing:
+                connection.execute(f'ALTER TABLE accounts ADD COLUMN {name} {spec}')
+    connection.execute("UPDATE reservation_plans SET execution_mode='browser'")
+
+
+def _add_browser_columns(connection) -> None:
+    additions = {
+        "reservation_plans": {"execution_mode": "VARCHAR(16) NOT NULL DEFAULT 'api'"},
+        "reservation_runs": {"heartbeat_at": "DATETIME", "expires_at": "DATETIME",
+                             "possibly_submitted": "BOOLEAN NOT NULL DEFAULT 0"},
+    }
+    for table, fields in additions.items():
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue
+        for name, spec in fields.items():
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
 
 def init_db() -> None:

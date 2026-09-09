@@ -5,32 +5,254 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>超星本地抢座</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1160px; color: #1e293b; }
-    section { border: 1px solid #dbe3ef; border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
-    input, button, select { padding: .45rem; margin: .2rem; font: inherit; }
-    button { cursor: pointer; } button:disabled { cursor: wait; opacity: .6; }
-    .muted { color: #64748b; font-size: .9rem; }.notice { display: none; border-radius: 6px; margin: .8rem 0; padding: .7rem; }
-    .notice.error { display: block; color: #8a1c1c; background: #fff0f0; border: 1px solid #efb5b5; }.notice.success { display: block; color: #155724; background: #effaf1; border: 1px solid #a9d9b0; }
-    .duplicate-confirm { margin: .8rem 0; padding: .8rem; border: 1px solid #f4b860; border-radius: 7px; background: #fff8eb; color: #713f12; }.duplicate-confirm p { margin: .25rem 0; }.duplicate-confirm .actions { display: flex; gap: .3rem; margin-top: .55rem; }
-    .plan-form { display: grid; grid-template-columns: repeat(4, minmax(135px, 1fr)); gap: .35rem; align-items: end; }.field { display: flex; flex-direction: column; font-size: .9rem; color: #475569; }.field input,.field select { box-sizing: border-box; width: 100%; margin: .2rem 0; }.actions,.weekday-field,.select-link-field { grid-column: 1 / -1; }.weekday-field label { margin-right: .6rem; white-space: nowrap; }.weekday-field input { width: auto; }.plan-card { border-top: 1px solid #eef2f7; padding: .8rem 0; }.plan-card p { margin: .25rem 0; } .tag { display: inline-block; background:#eef6ff; color:#1d4ed8; border-radius:999px; padding:.1rem .45rem; margin-right:.25rem; font-size:.82rem; }
-    .seat-field { grid-column: span 2; }.seat-entry { display: flex; align-items: center; gap: .25rem; }.seat-entry input { min-width: 0; margin: .2rem 0; }.seat-entry button { white-space: nowrap; margin: .2rem 0; }.seat-help { color: #64748b; font-size: .8rem; }.seat-feedback { min-height: 1.2rem; margin: .2rem 0 0; font-size: .85rem; }.seat-feedback.error { color: #b91c1c; }.seat-feedback.success { color: #15803d; }.seat-list { display: grid; gap: .35rem; margin-top: .35rem; }.seat-empty { margin: .1rem 0; color: #64748b; font-size: .85rem; }.seat-item { display: flex; align-items: center; gap: .45rem; min-height: 2.25rem; padding: .35rem .45rem; border: 1px solid #bfdbfe; border-radius: 7px; background: #f8fbff; }.seat-item.dragging { opacity: .45; }.seat-rank { flex: 0 0 auto; min-width: 1.65rem; color: #1d4ed8; font-weight: 700; }.seat-number { flex: 1 1 auto; font-variant-numeric: tabular-nums; font-weight: 650; color: #0f172a; }.seat-actions { display: flex; gap: .15rem; }.seat-actions button { margin: 0; padding: .25rem .42rem; font-size: .82rem; }.bulk-seats { margin-top: .35rem; }.bulk-seats textarea { box-sizing: border-box; width: 100%; min-height: 4.8rem; margin: .2rem 0; font: inherit; }.bulk-actions { display: flex; gap: .25rem; }.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-    table { border-collapse: collapse; width: 100%; font-size: .9rem; } td,th { border-bottom: 1px solid #eef2f7; padding: .45rem; text-align: left; vertical-align: top; }.status-SUCCESS,.status-PROBE_DONE { color:#15803d; }.status-FAILED,.status-BLOCKED_BY_RISK,.status-NEEDS_VERIFICATION { color:#b91c1c; }.status-PENDING,.status-RUNNING { color:#b45309; }.probe-seats { display:flex; flex-wrap:wrap; gap:.25rem; margin-top:.3rem; }.probe-chip { border-radius:999px; padding:.05rem .5rem; font-size:.8rem; }.probe-chip.ok { background:#effaf1; color:#15803d; border:1px solid #a9d9b0; }.probe-chip.warn { background:#fff8eb; color:#713f12; border:1px solid #f4b860; }
-    @media (max-width:760px) { body { margin: 1rem; }.plan-form { grid-template-columns: repeat(2, minmax(130px,1fr)); }.seat-field { grid-column: 1 / -1; } .seat-entry { flex-wrap: wrap; }.seat-entry input { flex: 1 1 100%; } table { display:block; overflow-x:auto; } }
+    :root {
+      color-scheme: light;
+      --bg: #f3f6fb;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --line: #dce4ef;
+      --line-soft: #e9eef5;
+      --ink: #172033;
+      --muted: #66758b;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --primary-soft: #eff6ff;
+      --success: #15803d;
+      --success-soft: #edf9f0;
+      --warning: #a15c07;
+      --warning-soft: #fff8e8;
+      --danger: #b42318;
+      --danger-soft: #fff1f0;
+      --shadow: 0 14px 34px rgba(24, 39, 75, .07);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, -apple-system, sans-serif;
+      font-size: 15px;
+      line-height: 1.55;
+    }
+    body::before {
+      position: fixed;
+      inset: 0 0 auto;
+      z-index: -1;
+      height: 330px;
+      background: linear-gradient(135deg, #172554 0%, #1e3a8a 45%, #2563eb 100%);
+      content: "";
+    }
+    .app-shell { width: min(1180px, calc(100% - 40px)); margin: 0 auto; padding: 36px 0 56px; }
+    .page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 32px; min-height: 165px; padding: 10px 8px 30px; color: #fff; }
+    .eyebrow { margin: 0 0 8px; color: #bfdbfe; font-size: 12px; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 42px); line-height: 1.2; letter-spacing: -.035em; }
+    .hero-copy { max-width: 720px; margin: 13px 0 0; color: #dbeafe; font-size: 15px; }
+    .hero-badge { display: inline-flex; align-items: center; gap: 9px; flex: 0 0 auto; margin-top: 10px; padding: 9px 13px; border: 1px solid rgba(255,255,255,.22); border-radius: 999px; background: rgba(255,255,255,.1); color: #eff6ff; font-size: 13px; font-weight: 650; backdrop-filter: blur(8px); }
+    .hero-badge::before { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 0 4px rgba(74,222,128,.14); content: ""; }
+    section { margin: 0 0 18px; padding: 24px; border: 1px solid rgba(220,228,239,.9); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow); }
+    section h2 { margin: 0; font-size: 20px; line-height: 1.35; letter-spacing: -.018em; }
+    .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
+    .section-heading .muted { max-width: 760px; margin: 5px 0 0; }
+    .section-kicker { display: block; margin-bottom: 3px; color: var(--primary); font-size: 11px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .setup-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; align-items: stretch; }
+    .setup-grid section { margin: 0; }
+    .setup-grid .account-section { grid-row: span 2; }
+    .setup-grid .browser-section { grid-column: 2; }
+    .plan-section, .runs-section { margin-top: 18px; }
+    .muted { color: var(--muted); font-size: .88rem; }
+    code { padding: 2px 6px; border: 1px solid #dbe5f2; border-radius: 6px; background: #f4f7fb; color: #334155; font-family: Consolas, monospace; font-size: .84em; }
+    input, button, select, textarea { font: inherit; }
+    input, select, textarea {
+      min-height: 42px;
+      padding: 9px 11px;
+      border: 1px solid #cbd5e1;
+      border-radius: 9px;
+      outline: none;
+      background: #fff;
+      color: var(--ink);
+      transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+    }
+    input:hover, select:hover, textarea:hover { border-color: #94a3b8; }
+    input:focus, select:focus, textarea:focus { border-color: #60a5fa; box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
+    input::placeholder, textarea::placeholder { color: #94a3b8; }
+    button {
+      min-height: 38px;
+      margin: 3px 4px 3px 0;
+      padding: 7px 13px;
+      border: 1px solid #cbd5e1;
+      border-radius: 9px;
+      background: #fff;
+      color: #334155;
+      font-weight: 650;
+      cursor: pointer;
+      transition: transform .12s ease, border-color .16s ease, background .16s ease, box-shadow .16s ease;
+    }
+    button:hover:not(:disabled) { border-color: #93a4bb; background: #f8fafc; box-shadow: 0 3px 9px rgba(15,23,42,.06); }
+    button:active:not(:disabled) { transform: translateY(1px); }
+    button:focus-visible { outline: 3px solid rgba(37,99,235,.22); outline-offset: 2px; }
+    button:disabled { cursor: wait; opacity: .55; }
+    form button[type="submit"], #save-plan, #save-notify, #add-seat, #confirm-bulk-seats, #confirm-duplicate {
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #fff;
+    }
+    form button[type="submit"]:hover:not(:disabled), #save-plan:hover:not(:disabled), #save-notify:hover:not(:disabled), #add-seat:hover:not(:disabled), #confirm-bulk-seats:hover:not(:disabled), #confirm-duplicate:hover:not(:disabled) { border-color: var(--primary-dark); background: var(--primary-dark); }
+    button[onclick^="del"] { border-color: #fecaca; color: var(--danger); }
+    button[onclick^="del"]:hover:not(:disabled) { border-color: #fca5a5; background: var(--danger-soft); }
+    button[onclick^="runPlan"], button[onclick^="checkLogin"] { border-color: #a9c7fb; background: var(--primary-soft); color: var(--primary-dark); }
+    button[onclick^="runPlan"]:hover:not(:disabled), button[onclick^="checkLogin"]:hover:not(:disabled) { border-color: #7eabf5; background: #e0ecff; }
+    #account-form { display: grid; grid-template-columns: 1fr 1.2fr; gap: 10px; margin: 18px 0 8px; }
+    #account-form input { width: 100%; min-width: 0; }
+    #account-form input[name="password"] { grid-column: 1 / -1; }
+    #account-form button { justify-self: start; }
+    .notice { display: none; position: sticky; top: 12px; z-index: 20; margin: 0 0 16px; padding: 12px 15px; border-radius: 11px; box-shadow: 0 8px 24px rgba(15,23,42,.1); font-weight: 650; }
+    .notice.error { display: block; border: 1px solid #f5b9b5; background: var(--danger-soft); color: #8f1d15; }
+    .notice.success { display: block; border: 1px solid #a7dbb3; background: var(--success-soft); color: #166534; }
+    #health-warning:not([hidden]) { display: block; margin: -8px 0 18px; padding: 11px 14px; border: 1px solid #f2c879; border-radius: 11px; background: var(--warning-soft); color: #7c4708; box-shadow: var(--shadow); }
+    .duplicate-confirm { margin: 0 0 18px; padding: 15px 17px; border: 1px solid #f2c879; border-radius: 12px; background: var(--warning-soft); color: #713f12; box-shadow: var(--shadow); }
+    .duplicate-confirm p { margin: 5px 0; }
+    .duplicate-confirm .actions { display: flex; gap: 6px; margin-top: 10px; }
+    .plan-form { display: grid; grid-template-columns: repeat(4, minmax(135px, 1fr)); gap: 15px; align-items: end; padding: 20px; border: 1px solid var(--line-soft); border-radius: 13px; background: var(--surface-soft); }
+    .field { display: flex; flex-direction: column; gap: 5px; color: #445269; font-size: .88rem; font-weight: 650; }
+    .field input, .field select { width: 100%; margin: 0; font-weight: 400; }
+    .field small { font-weight: 400; }
+    .actions, .weekday-field, .select-link-field { grid-column: 1 / -1; }
+    .actions { display: flex; flex-wrap: wrap; gap: 5px; }
+    .weekday-field { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 4px; }
+    .weekday-field strong { margin-right: 4px; color: #445269; font-size: .9rem; }
+    .weekday-field label, .check { display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: #475569; white-space: nowrap; cursor: pointer; }
+    .weekday-field input, .check input { width: 16px; min-height: auto; height: 16px; margin: 0; accent-color: var(--primary); }
+    .plan-card { margin-top: 13px; padding: 17px 18px; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 4px 14px rgba(15,23,42,.035); }
+    .plan-card p { margin: 4px 0; }
+    .plan-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+    .plan-card-head > div { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+    .plan-card-head strong { color: #111827; font-size: 1.06rem; }
+    .plan-state { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 999px; font-size: .76rem; font-weight: 750; }
+    .plan-state::before { width: 6px; height: 6px; border-radius: 50%; content: ""; }
+    .plan-state.on { background: var(--success-soft); color: var(--success); }
+    .plan-state.on::before { background: #22c55e; }
+    .plan-state.off { background: #f1f5f9; color: #64748b; }
+    .plan-state.off::before { background: #94a3b8; }
+    .plan-facts { display: grid; grid-template-columns: .7fr 1.65fr .9fr 1.5fr 1.35fr; gap: 9px; margin-bottom: 10px; }
+    .plan-fact { min-width: 0; padding: 9px 10px; border-radius: 9px; background: var(--surface-soft); }
+    .plan-fact small { display: block; margin-bottom: 2px; color: #7b899c; font-size: .7rem; font-weight: 700; letter-spacing: .025em; }
+    .plan-fact b { display: block; overflow-wrap: anywhere; color: #29364a; font-size: .86rem; font-weight: 700; }
+    .plan-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; margin-top: 10px; }
+    #plans details { display: inline-block; margin-right: 4px; }
+    #plans summary { padding: 7px 4px; color: #526176; cursor: pointer; font-size: .88rem; font-weight: 650; }
+    .tag { display: inline-flex; align-items: center; margin: 2px 4px 2px 0; padding: 3px 8px; border: 1px solid #cfe0ff; border-radius: 999px; background: var(--primary-soft); color: var(--primary-dark); font-size: .78rem; font-weight: 700; vertical-align: middle; }
+    .seat-field { grid-column: span 2; }
+    .seat-entry { display: flex; align-items: center; gap: 7px; }
+    .seat-entry input { min-width: 0; flex: 1; }
+    .seat-entry button { flex: 0 0 auto; white-space: nowrap; }
+    .seat-help { color: var(--muted); font-size: .78rem; line-height: 1.5; }
+    .seat-feedback { min-height: 1.2rem; margin: 4px 0 0; font-size: .84rem; }
+    .seat-feedback.error { color: var(--danger); }
+    .seat-feedback.success { color: var(--success); }
+    .seat-list { display: grid; gap: 7px; margin-top: 7px; }
+    .seat-empty { margin: 3px 0; color: var(--muted); font-size: .84rem; font-weight: 400; }
+    .seat-item { display: flex; align-items: center; gap: 8px; min-height: 42px; padding: 6px 8px; border: 1px solid #bfd5fb; border-radius: 9px; background: #f6f9ff; }
+    .seat-item.dragging { opacity: .45; }
+    .seat-rank { display: grid; place-items: center; flex: 0 0 auto; width: 25px; height: 25px; border-radius: 7px; background: #dbeafe; color: var(--primary-dark); font-size: .78rem; font-weight: 800; }
+    .seat-number { flex: 1 1 auto; color: #0f172a; font-variant-numeric: tabular-nums; font-weight: 750; }
+    .seat-actions { display: flex; gap: 3px; }
+    .seat-actions button { min-height: 30px; margin: 0; padding: 4px 8px; font-size: .78rem; }
+    .bulk-seats { margin-top: 8px; padding: 10px; border: 1px dashed #bfcee2; border-radius: 9px; background: #fff; }
+    .bulk-seats textarea { width: 100%; min-height: 82px; margin: 5px 0; resize: vertical; }
+    .bulk-actions { display: flex; gap: 5px; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .table-shell { max-height: 760px; overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: #fff; scrollbar-gutter: stable; }
+    table { width: 100%; min-width: 860px; border-collapse: separate; border-spacing: 0; table-layout: fixed; font-size: .86rem; }
+    th { position: sticky; top: 0; z-index: 1; padding: 11px 12px; border-bottom: 1px solid var(--line); background: #f3f6fa; color: #516076; font-size: .76rem; font-weight: 800; letter-spacing: .035em; text-transform: uppercase; }
+    td { padding: 13px 12px; border-bottom: 1px solid var(--line-soft); color: #344154; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: #fafcff; }
+    th:nth-child(1), td:nth-child(1) { width: 13%; }
+    th:nth-child(2), td:nth-child(2) { width: 17%; }
+    th:nth-child(3), td:nth-child(3) { width: 14%; }
+    th:nth-child(4), td:nth-child(4) { width: 16%; }
+    th:nth-child(5), td:nth-child(5) { width: 40%; }
+    td small { color: var(--muted); line-height: 1.45; }
+    td[class^="status-"] { font-weight: 750; }
+    .status-SUCCESS { color: var(--success); }
+    .status-PROBE_DONE, .status-SKIPPED { color: #526176; }
+    .status-FAILED, .status-BLOCKED_BY_RISK, .status-NEEDS_VERIFICATION { color: var(--danger); }
+    .status-PENDING, .status-RUNNING, .status-WAITING_LOGIN, .status-WAITING_OPEN, .status-WAITING_USER, .status-VERIFYING { color: var(--warning); }
+    .probe-seats { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+    .probe-chip { padding: 2px 7px; border-radius: 999px; font-size: .76rem; }
+    .probe-chip.ok { border: 1px solid #a9d9b0; background: var(--success-soft); color: var(--success); }
+    .probe-chip.warn { border: 1px solid #f2c879; background: var(--warning-soft); color: #713f12; }
+    @media (max-width: 900px) {
+      .app-shell { width: min(100% - 24px, 760px); padding-top: 24px; }
+      .page-header { min-height: 145px; padding-inline: 4px; }
+      .hero-badge { display: none; }
+      .setup-grid { grid-template-columns: 1fr; }
+      .setup-grid .account-section, .setup-grid .browser-section { grid-column: auto; grid-row: auto; }
+      .plan-form { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
+      .seat-field { grid-column: 1 / -1; }
+      .plan-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 620px) {
+      body::before { height: 300px; }
+      .app-shell { width: min(100% - 18px, 560px); padding: 18px 0 36px; }
+      .page-header { min-height: 150px; padding: 8px 6px 24px; }
+      h1 { font-size: 28px; }
+      .hero-copy { font-size: 13px; }
+      section { padding: 18px 15px; border-radius: 14px; }
+      .section-heading { align-items: center; }
+      #account-form, .plan-form { grid-template-columns: 1fr; }
+      #account-form input[name="password"], .actions, .weekday-field, .select-link-field, .seat-field { grid-column: 1; }
+      .seat-entry { flex-wrap: wrap; }
+      .seat-entry input { flex-basis: 100%; }
+      .weekday-field { align-items: stretch; }
+      .weekday-field strong { flex-basis: 100%; }
+      .weekday-field label { flex: 1 0 calc(25% - 6px); justify-content: center; }
+      .table-shell { max-height: 780px; overflow-y: auto; overflow-x: hidden; padding-right: 3px; border: 0; background: transparent; }
+      table, tbody, tr, td { display: block; min-width: 0; width: 100%; }
+      thead { display: none; }
+      tbody { display: grid; gap: 10px; }
+      tbody tr { padding: 12px 13px; border: 1px solid var(--line); border-radius: 11px; background: #fff; box-shadow: 0 3px 10px rgba(15,23,42,.035); }
+      td, th:nth-child(n), td:nth-child(n) { width: 100%; }
+      td { display: grid; grid-template-columns: 92px 1fr; gap: 8px; padding: 5px 0; border: 0; }
+      td::before { color: #78869a; font-size: .72rem; font-weight: 750; letter-spacing: .03em; content: attr(data-label); }
+      tbody tr:hover td { background: transparent; }
+    }
   </style>
 </head>
 <body>
-  <h1>超星图书馆本地预约</h1>
-  <p class="muted">仅监听 localhost。不同账号可受控并行；同账号会串行。候选座位按顺序轮流尝试，每个候选座位只尝试一次（最多 6 个候选），两次提交之间有短暂随机间隔。</p>
-  <p id="health-warning" class="muted" hidden></p>
-  <div id="notice" class="notice" role="alert"></div>
-  <div id="duplicate-confirm" class="duplicate-confirm" hidden role="alertdialog" aria-labelledby="duplicate-confirm-title"><strong id="duplicate-confirm-title">可能存在重复预约</strong><p id="duplicate-confirm-message"></p><div class="actions"><button type="button" id="cancel-duplicate">返回检查</button><button type="button" id="confirm-duplicate">确认仍然执行一次</button></div></div>
-  <section><h2>账号</h2><form id="account-form"><input name="name" placeholder="名称" required><input name="username" placeholder="超星账号" required><input name="password" type="password" placeholder="密码" required><button>保存账号</button></form><div id="accounts"></div></section>
-  <section><h2>结果通知</h2><p class="muted">预约任务的结果（成功/失败/需确认）会推送到手机；探测与自动发现任务不推送。</p>
-    <div class="seat-entry"><select id="notify-type"><option value="none">不启用</option><option value="serverchan">Server酱（微信）</option><option value="bark">Bark（iOS）</option><option value="wecom_webhook">企业微信机器人</option></select><input id="notify-key" placeholder="SendKey / Bark Key / 机器人 Webhook 地址" style="flex:1"><button type="button" id="save-notify">保存</button><button type="button" id="test-notify">发送测试</button></div>
-    <p id="notify-feedback" class="seat-feedback" role="status"></p>
-  </section>
-  <section>
-    <h2>预约计划</h2><p class="muted">“任务执行星期”表示哪天运行；“预约第几天”表示从运行日向后预约几天。探测不提交预约。</p>
+  <main class="app-shell">
+    <header class="page-header">
+      <div>
+        <p class="eyebrow">Local Reservation Console</p>
+        <h1>超星图书馆本地预约</h1>
+        <p class="hero-copy">提前检查登录，到点自动提交。只有登录失效或出现验证码时，程序才会显示官方窗口等待你处理。</p>
+      </div>
+      <div class="hero-badge">预约服务运行中</div>
+    </header>
+    <p id="health-warning" class="muted" hidden></p>
+    <div id="notice" class="notice" role="alert"></div>
+    <div id="duplicate-confirm" class="duplicate-confirm" hidden role="alertdialog" aria-labelledby="duplicate-confirm-title"><strong id="duplicate-confirm-title">可能存在重复预约</strong><p id="duplicate-confirm-message"></p><div class="actions"><button type="button" id="cancel-duplicate">返回检查</button><button type="button" id="confirm-duplicate">确认仍然执行一次</button></div></div>
+    <div class="setup-grid">
+      <section class="account-section">
+        <div class="section-heading"><div><span class="section-kicker">Accounts</span><h2>账号</h2><p class="muted">为每个账号保存独立登录状态，预约前可随时检查。</p></div></div>
+        <form id="account-form"><input name="name" aria-label="账号名称" placeholder="名称" required><input name="username" aria-label="超星账号" placeholder="超星账号" required><input name="password" type="password" aria-label="密码" placeholder="密码（可不填，在官方窗口登录）"><button>保存账号</button></form><div id="accounts"></div>
+      </section>
+      <section class="notify-section">
+        <div class="section-heading"><div><span class="section-kicker">Notification</span><h2>结果通知</h2><p class="muted">推送成功、失败或需要确认的正式预约结果。</p></div></div>
+        <div class="seat-entry"><select id="notify-type" aria-label="通知方式"><option value="none">不启用</option><option value="serverchan">Server酱（微信）</option><option value="bark">Bark（iOS）</option><option value="wecom_webhook">企业微信机器人</option></select><input id="notify-key" aria-label="通知密钥" placeholder="SendKey / Bark Key / 机器人 Webhook 地址" style="flex:1"><button type="button" id="save-notify">保存</button><button type="button" id="test-notify">发送测试</button></div>
+        <p id="notify-feedback" class="seat-feedback" role="status"></p>
+      </section>
+      <section class="browser-section">
+        <div class="section-heading"><div><span class="section-kicker">Browser</span><h2>浏览器接管</h2><p id="browser-status" class="muted" role="status">正在检查浏览器组件…</p></div></div>
+        <button type="button" id="browser-check">检查浏览器组件</button>
+        <p class="muted">首次使用请运行 <code>scripts\install_browser.ps1</code>，再点击账号的“检查登录／提前登录”。</p>
+        <p class="muted">定时任务期间，电脑需保持唤醒，Windows 桌面需登录并解锁。</p>
+      </section>
+    </div>
+    <section class="plan-section">
+      <div class="section-heading"><div><span class="section-kicker">Schedules</span><h2>预约计划</h2><p class="muted">设置执行日、目标日期、候选座位和完整使用时段。辅助诊断不会提交预约。</p></div></div>
     <form id="plan-form" class="plan-form">
       <label class="field">账号<select name="account_id" id="account" required></select></label><label class="field">计划名称<input name="name" placeholder="例如：明日座位" required></label><label class="field">阅览室 ID<input name="room_id" placeholder="例如：10713" required></label>
       <label class="field select-link-field">预约参数（自动发现）<small id="select-params-view" class="seat-help"></small><div class="seat-entry"><input id="select-url" placeholder="高级兜底：粘贴超星选座页链接（通常不需要）"><button type="button" id="parse-select-url">保存高级覆盖</button></div></label>
@@ -50,17 +272,22 @@
         <p id="seat-feedback" class="seat-feedback" role="status" aria-live="polite"></p>
       </div>
       <label class="field">使用开始时间<input name="start_time" type="time" value="08:00" required></label><label class="field">使用结束时间<input name="end_time" type="time" value="20:00" required></label><label class="field">自动执行时间<input name="run_time" type="time" value="06:59" required></label><label class="field">预约第几天<input name="day_offset" type="number" value="1" min="0" max="7"><small>0=今天，1=明天</small></label>
-      <label class="field">总尝试次数<input name="max_attempts" type="number" value="3" min="1" max="6"><small>候选座位各尝试一次、不重复，上限 6 个座位</small></label><label class="check">启用计划<input name="enabled" type="checkbox" checked></label><span class="muted">检测到滑块或点选验证码时会安全停止，并提示人工处理。</span>
+      <input type="hidden" name="execution_mode" value="browser"><label class="field">总尝试次数<input name="max_attempts" type="number" value="3" min="1" max="6"><small>候选座位各尝试一次、不重复，上限 6 个座位</small></label><label class="check">启用计划<input name="enabled" type="checkbox" checked></label><span class="muted">提前 10 分钟检查登录，提前 30 秒准备页面；无需验证码时自动提交。</span>
       <div class="weekday-field"><strong>任务执行星期：</strong><label><input type="checkbox" name="weekdays" value="Monday" checked>周一</label><label><input type="checkbox" name="weekdays" value="Tuesday" checked>周二</label><label><input type="checkbox" name="weekdays" value="Wednesday" checked>周三</label><label><input type="checkbox" name="weekdays" value="Thursday" checked>周四</label><label><input type="checkbox" name="weekdays" value="Friday" checked>周五</label><label><input type="checkbox" name="weekdays" value="Saturday">周六</label><label><input type="checkbox" name="weekdays" value="Sunday">周日</label></div>
-      <div class="actions"><button type="submit" id="save-plan">保存计划</button><button type="button" id="save-probe">保存并探测</button><button type="button" id="cancel-edit" hidden>取消编辑</button></div>
-    </form><div id="plans"></div>
-  </section>
-  <section><h2>运行记录</h2><button type="button" id="refresh-runs">刷新</button><table><thead><tr><th>北京时间</th><th>计划 / 账号</th><th>目标日 / 座位</th><th>状态</th><th>消息</th></tr></thead><tbody id="runs"></tbody></table></section>
+      <div class="actions"><button type="submit" id="save-plan">保存计划</button><button type="button" id="save-probe" hidden>保存并探测</button><button type="button" id="cancel-edit" hidden>取消编辑</button></div>
+      </form><div id="plans"></div>
+    </section>
+    <section class="runs-section">
+      <div class="section-heading"><div><span class="section-kicker">History</span><h2>运行记录</h2><p class="muted">页面每 5 秒自动刷新，最新记录显示在最上方。</p></div><button type="button" id="refresh-runs">立即刷新</button></div>
+      <div class="table-shell"><table><thead><tr><th>北京时间</th><th>计划 / 账号</th><th>目标日 / 座位</th><th>状态</th><th>消息</th></tr></thead><tbody id="runs"></tbody></table></div>
+    </section>
+  </main>
   <script>
     let csrf={{ csrf|tojson }}; const form=document.querySelector('#plan-form'), notice=document.querySelector('#notice'), duplicateConfirm=document.querySelector('#duplicate-confirm'), duplicateConfirmMessage=document.querySelector('#duplicate-confirm-message');
     const seatEntry=document.querySelector('#seat-entry'), seatList=document.querySelector('#seat-list'), seatEmpty=document.querySelector('#seat-empty'), seatFeedback=document.querySelector('#seat-feedback'), bulkSeats=document.querySelector('#bulk-seats'), bulkSeatEntry=document.querySelector('#bulk-seat-entry');
     let editingId=null, candidateSeats=[], draggingSeatIndex=null, pendingDuplicateRunId=null, selectParams=null, selectContextPath=null, selectContextSource=null;
     function seatLimit(){const value=Number(form.elements.max_attempts.value);return Number.isFinite(value)&&value>=1?Math.min(Math.floor(value),6):3}
+    const activeStatuses=['PENDING','RUNNING','WAITING_LOGIN','WAITING_OPEN','WAITING_USER','VERIFYING'];
     const days=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
     function escapeHtml(value){return String(value??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')} function showNotice(message,type='error'){notice.textContent=message;notice.className=`notice ${type}`} function clearNotice(){notice.className='notice';notice.textContent=''} function hideDuplicateConfirm(){pendingDuplicateRunId=null;duplicateConfirm.hidden=true;duplicateConfirmMessage.textContent=''} function showDuplicateConfirm(run){pendingDuplicateRunId=run.id;duplicateConfirmMessage.textContent=`${run.message}。确认后只会额外执行这一次，并留下运行记录。`;duplicateConfirm.hidden=false;document.querySelector('#confirm-duplicate').focus()}
     async function api(url,options={},retried=false){const response=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,...(options.headers||{})}});let data;try{data=await response.json()}catch{data={}}if(response.status===403&&!retried){const token=await fetch('/api/csrf').then(r=>r.json());csrf=token.token;return api(url,options,true)}if(!response.ok){const detail=Array.isArray(data.detail)?data.detail.map(item=>item.msg).join('；'):(data.detail||'请求失败');throw new Error(detail)}return data}
@@ -70,10 +297,11 @@
     function shanghaiParts(offsetDays=0){const date=new Date(Date.now()+(Number(offsetDays)||0)*86400000);const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(date);const get=type=>{const found=parts.find(item=>item.type===type);return found?found.value:''};return {date:`${get('year')}-${get('month')}-${get('day')}`,weekdayShort:get('weekday'),minutes:Number(get('hour'))*60+Number(get('minute'))}}
     function targetDateCN(offsetDays){return shanghaiParts(offsetDays).date}
     function nextRunCN(plan){const names=Array.isArray(plan.weekdays)?plan.weekdays:[];const [runHour,runMinute]=String(plan.run_time||'06:59').split(':').map(Number);const runMinutes=runHour*60+runMinute;for(let offset=0;offset<8;offset++){const parts=shanghaiParts(offset);const name=weekdayShortNames[parts.weekdayShort];if(!name||!names.includes(name))continue;if(offset===0&&parts.minutes>=runMinutes)continue;return `${parts.date} ${String(runHour).padStart(2,'0')}:${String(runMinute).padStart(2,'0')}`}return '—'}
-    function nextRunDisplay(plan){return plan.next_run_at?timeCN(plan.next_run_at):nextRunCN(plan)}
+    function nextRunDisplay(plan){return !plan.enabled?'已停用':plan.next_run_at?timeCN(plan.next_run_at):'暂无已排定任务'}
+    function nextTargetDate(plan){if(!plan.enabled||!plan.next_run_at)return '—';const date=new Date(new Date(plan.next_run_at).getTime()+Number(plan.day_offset)*86400000);const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(date);const get=type=>parts.find(p=>p.type===type).value;return `${get('year')}-${get('month')}-${get('day')}`}
     function probeStateLabel(item){const map={TOKEN_READY:'参数就绪',TARGET_DAY_NOT_OPEN:'等待预约窗口开放',CURRENTLY_OCCUPIED:'页面提示占用',LOGIN_REQUIRED:'需重新登录',SECURITY_CHALLENGE:'安全验证',SLIDER_CAPTCHA:'滑块验证码',POINT_CLICK_CAPTCHA:'点选验证码',TOKEN_MISSING:'页面无预约参数',ALGORITHM_MISSING:'缺少签名参数',SELECT_PAGE_ERROR:'选座页异常',UNKNOWN_PAGE:'未知页面'};return map[item.page_state]||item.page_state||''}
     function renderProbeSeats(results){if(!Array.isArray(results)||!results.length)return '';const seats=results.filter(item=>item.seat!=='-');if(!seats.length)return '';return `<div class="probe-seats">${seats.map(item=>`<span class="probe-chip ${item.ok?'ok':'warn'}" title="${escapeHtml(item.message||'')}">座位 ${escapeHtml(item.seat)}：${escapeHtml(probeStateLabel(item))}</span>`).join('')}</div>`}
-    function setSelectParamsView(){const view=document.querySelector('#select-params-view');if(!view)return;if(selectParams&&Object.keys(selectParams).length){view.textContent=`已保存高级链接覆盖：${Object.keys(selectParams).join('、')}。`;view.style.color='#15803d'}else{view.textContent='保存并探测或“自动发现参数”会在登录后取得目标日参数；只有少数学校失败时才需要手动粘贴链接。';view.style.color=''}}
+    function setSelectParamsView(){const view=document.querySelector('#select-params-view');if(!view)return;if(selectParams&&Object.keys(selectParams).length){view.textContent=`已保存高级链接覆盖：${Object.keys(selectParams).join('、')}。`;view.style.color='#15803d'}else{view.textContent='通常无需填写，程序会打开官方预约页面；只有学校入口不同时才需要手动粘贴链接。';view.style.color=''}}
     async function parseSelectUrl(){const input=document.querySelector('#select-url');const raw=String(input&&input.value||'').trim();if(!raw){selectParams=null;selectContextPath=null;selectContextSource=null;setSelectParamsView();return}const result=await api('/api/tools/parse-select-url',{method:'POST',body:JSON.stringify({url:raw})});selectParams=result.params;selectContextPath=result.select_context_path;selectContextSource='advanced_manual';if(result.room_id&&!form.elements.room_id.value.trim())form.elements.room_id.value=result.room_id;if(input)input.value='';setSelectParamsView();showNotice(`已保存高级链接覆盖（${Object.keys(selectParams).length} 个参数）。`,'success')}
     function normalizeSeat(value){const raw=String(value??'').trim();if(!raw)return {error:'请先输入座位号。'};if(!/^\d+$/.test(raw))return {error:'座位号只能包含数字。'};if(raw.length>16)return {error:'座位号不能超过 16 位。'};return {value:raw.padStart(3,'0')}}
     function setSeatFeedback(message='',type=''){seatFeedback.textContent=message;seatFeedback.className=`seat-feedback ${type}`.trim();seatEntry.setAttribute('aria-invalid',String(type==='error'))}
@@ -86,19 +314,27 @@
     function notifyFeedback(message='',type=''){const el=document.querySelector('#notify-feedback');el.textContent=message;el.className=`seat-feedback ${type}`.trim()}
     async function saveNotify(){const payload={notify_type:document.querySelector('#notify-type').value,notify_key:document.querySelector('#notify-key').value};await api('/api/settings',{method:'PUT',body:JSON.stringify(payload)});notifyFeedback('通知设置已保存。','success')}
     async function testNotify(){try{notifyFeedback('正在发送测试通知…');await api('/api/settings/test',{method:'POST'});notifyFeedback('测试通知已发出，请查看手机。','success')}catch(error){notifyFeedback(error.message||'发送失败','error')}}
-    async function load(){const health=await api('/health');const healthWarning=document.querySelector('#health-warning');healthWarning.hidden=!health.clock_warning;healthWarning.textContent=health.clock_warning||'';if(health.server_clock&&health.server_clock.error)healthWarning.textContent=`${healthWarning.textContent} ${health.server_clock.error}`.trim();await loadNotify();const accounts=await api('/api/accounts');document.querySelector('#accounts').innerHTML=accounts.map(a=>`<p>${escapeHtml(a.name)}（${escapeHtml(a.username)}）<button onclick="toggleAccount(${a.id},${!a.enabled})">${a.enabled?'停用':'启用'}</button><button onclick="delAccount(${a.id})">删除</button></p>`).join('');document.querySelector('#account').innerHTML=accounts.map(a=>`<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('');const plans=await api('/api/plans');window.planCache=Object.fromEntries(plans.map(p=>[p.id,p]));document.querySelector('#plans').innerHTML=plans.map(p=>`<div class="plan-card"><p><strong>${escapeHtml(p.name)}</strong> ${p.enabled?'已启用':'未启用'} <span class="tag">账号 ${p.account_id}</span><span class="tag">总计 ${Math.min(p.max_attempts,6)} 次</span></p><p>房间 ${escapeHtml(p.room_id)}；候选座位：${escapeHtml(p.seats.join(' → '))}；使用 ${escapeHtml(p.start_time)}-${escapeHtml(p.end_time)}；下次自动执行 ${escapeHtml(nextRunDisplay(p))}；目标预约日 ${escapeHtml(targetDateCN(p.day_offset))}（偏移 ${p.day_offset} 天）</p><p class="muted">${p.select_params?`选座入口已保存（${escapeHtml(p.select_context_source||'高级覆盖')}）；目标日参数会在探测或执行时刷新。`:'尚未验证选座入口；可点击“自动发现参数”或“探测”，预约窗口未开放时仍可提前保存。'}</p><button onclick="editPlan(${p.id})">编辑</button><button onclick="togglePlan(${p.id},${!p.enabled})">${p.enabled?'停用':'启用'}</button><button onclick="discoverPlan(${p.id})">自动发现参数</button><button onclick="probe(${p.id})">探测</button><button onclick="runPlan(${p.id})">立即预约</button><button onclick="delPlan(${p.id})">删除</button></div>`).join('');await loadRuns()}
-    function runStatusLabel(run){if(run.status==='PROBE_DONE'||(['probe','discover'].includes(run.trigger)&&['PROBE_COMPLETE','PROBE_WAITING_OPEN'].includes(run.error_code)))return run.error_code==='PROBE_WAITING_OPEN'?'等待开放':'探测完成';const map={SUCCESS:'预约成功',FAILED:'失败',NEEDS_VERIFICATION:'待人工确认',PROBE_DONE:'探测完成',SKIPPED:'已跳过',PENDING:'排队中',RUNNING:'进行中',BLOCKED_BY_RISK:'风控拦截'};return map[run.status]||run.status} function errorCodeLabel(code){const map={POSSIBLE_DUPLICATE:'疑似重复预约',ALREADY_BOOKED_ON_SERVER:'超星端已有本场预约',RECENT_DUPLICATE:'短时重复已跳过',LEGACY_SUCCESS:'旧成功记录待确认',SEAT_UNAVAILABLE:'座位不可预约',CAPTCHA_REQUIRED:'需要验证码',LOGIN_REQUIRED:'登录失效',SECURITY_CHALLENGE:'安全验证',BLOCKED_BY_RISK:'风控拦截',PLAN_OR_ACCOUNT_DISABLED:'计划或账号已停用',WEEKDAY_NOT_ENABLED:'今天不执行',INVALID_TIME_RANGE:'时段无效',NO_CANDIDATE_SEAT:'未配置座位',ACCOUNT_BUSY_TIMEOUT:'账号任务繁忙',DEADLINE_EXCEEDED:'超时',TARGET_DAY_NOT_OPEN:'目标日未开放',TARGET_CONTEXT_UNAVAILABLE:'未取得预约参数',SUBMIT_OUTCOME_UNKNOWN:'提交结果未知',TOKEN_STALE:'页面停留过久，自动刷新重试',SUBMIT_REJECTED:'平台拒绝',PROBE_COMPLETE:'探测完成',PROBE_WAITING_OPEN:'等待预约窗口开放',NETWORK_ERROR:'网络错误',SERVER_ERROR:'平台服务异常',HTTP_REDIRECT:'平台跳转，自动重试',RATE_LIMITED:'操作频繁，自动退避重试',UNEXPECTED_ERROR:'意外错误'};return map[code]||code||''} function triggerLabel(trigger){return trigger==='probe'?'探测':trigger==='discover'?'自动发现':trigger==='scheduled'?'定时预约':trigger==='manual'?'手动预约':trigger==='manual_confirmed'?'确认后重抢':trigger} async function loadRuns(){const runs=await api('/api/runs');document.querySelector('#runs').innerHTML=runs.map(r=>`<tr><td>${escapeHtml(timeCN(r.started_at))}</td><td>${escapeHtml(r.plan_name)}<br><small>${escapeHtml(r.account_name)} · ${escapeHtml(triggerLabel(r.trigger))}</small></td><td>${escapeHtml(r.target_date||'—')}<br><small>${escapeHtml(r.selected_seat||r.candidate_seats.join(' → ')||'—')}</small></td><td class="status-${escapeHtml(r.status)}">${escapeHtml(runStatusLabel(r))}<br><small>${escapeHtml(errorCodeLabel(r.error_code))}</small></td><td>${escapeHtml(r.message||'')}${r.parameter_source?`<br><small>参数来源：${escapeHtml(r.parameter_source)}</small>`:''}${renderProbeSeats(r.probe_results)}${(r.status==='NEEDS_VERIFICATION'&&['POSSIBLE_DUPLICATE','LEGACY_SUCCESS'].includes(r.error_code))?`<br><button type="button" onclick="confirmRunDuplicate(${r.id})">确认重抢</button>`:''}</td></tr>`).join('')}
+    function renderPlanCard(p){return `<div class="plan-card"><div class="plan-card-head"><div><strong>${escapeHtml(p.name)}</strong><span class="plan-state ${p.enabled?'on':'off'}">${p.enabled?'已启用':'未启用'}</span></div><div><span class="tag">账号 ${p.account_id}</span><span class="tag">${p.seats.length} 个候选</span></div></div><div class="plan-facts"><span class="plan-fact"><small>阅览室</small><b>${escapeHtml(p.room_id)}</b></span><span class="plan-fact"><small>候选座位</small><b>${escapeHtml(p.seats.join(' → '))}</b></span><span class="plan-fact"><small>使用时段</small><b>${escapeHtml(p.start_time)}–${escapeHtml(p.end_time)}</b></span><span class="plan-fact"><small>下次执行</small><b>${escapeHtml(nextRunDisplay(p))}</b></span><span class="plan-fact"><small>目标预约日</small><b>${escapeHtml(nextTargetDate(p))} · 偏移 ${p.day_offset} 天</b></span></div><p class="muted">${p.select_params?`选座入口已保存（${escapeHtml(p.select_context_source||'高级覆盖')}）；程序在执行时读取官方页面。`:'使用官方选座入口；可先检查账号登录并保存计划，无需等待目标日期开放。'}</p><div class="plan-actions"><button onclick="editPlan(${p.id})">编辑</button><button onclick="togglePlan(${p.id},${!p.enabled})">${p.enabled?'停用':'启用'}</button><details><summary>辅助诊断（不提交预约）</summary><button onclick="browserPreview(${p.id})">检查预约页面</button><button onclick="discoverPlan(${p.id})">自动发现参数</button></details><button onclick="runPlan(${p.id})">立即预约</button><button onclick="delPlan(${p.id})">删除</button></div></div>`}
+    async function load(){const health=await api('/health');const healthWarning=document.querySelector('#health-warning');healthWarning.hidden=!health.clock_warning;healthWarning.textContent=health.clock_warning||'';if(health.server_clock&&health.server_clock.error)healthWarning.textContent=`${healthWarning.textContent} ${health.server_clock.error}`.trim();await loadNotify();await loadBrowserStatus();const accounts=await api('/api/accounts');renderAccounts(accounts);document.querySelector('#account').innerHTML=accounts.map(a=>`<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('');const plans=await api('/api/plans');window.planCache=Object.fromEntries(plans.map(p=>[p.id,p]));document.querySelector('#plans').innerHTML=plans.map(renderPlanCard).join('');await loadRuns()}
+    function runStatusLabel(run){if(run.error_code==='LOGIN_READY')return '登录已就绪';if(run.status==='RUNNING'&&!run.possibly_submitted)return '提前准备 · 尚未提交';if(run.status==='PROBE_DONE'||(['probe','discover'].includes(run.trigger)&&['PROBE_COMPLETE','PROBE_WAITING_OPEN'].includes(run.error_code)))return run.error_code==='PROBE_WAITING_OPEN'?'尚未开放 · 未预约':run.trigger==='browser_preview'?'演练完成 · 未预约':'检查完成 · 未预约';const map={WAITING_LOGIN:'等待登录',WAITING_OPEN:'等待开放',WAITING_USER:'等待人工验证 / 确认',VERIFYING:'核对结果',SUCCESS:'预约成功',FAILED:'失败',NEEDS_VERIFICATION:'待人工确认',PROBE_DONE:'探测完成',SKIPPED:'已跳过',PENDING:'排队中',RUNNING:'进行中',BLOCKED_BY_RISK:'风控拦截'};return map[run.status]||run.status} function errorCodeLabel(code){const map={LOGIN_READY:'登录已就绪',LOGIN_CHECK_FAILED:'登录检测失败',BROWSER_ACCOUNT_UNVERIFIED:'需核实浏览器账号',BROWSER_PREVIEW_READY:'浏览器演练通过',BROWSER_NOT_READY:'浏览器未就绪',BROWSER_START_FAILED:'浏览器启动失败',BROWSER_PAGE_UNSUPPORTED:'页面尚未适配或未开放',BROWSER_PRECHECK_FAILED:'预约核对未通过',BROWSER_INTENT_CHANGED:'页面信息与计划不符',BROWSER_CANCELLED:'接管已结束',BROWSER_WINDOW_CLOSED:'预约窗口意外关闭',BROWSER_RESERVATION_CONFLICT:'发现重叠预约',BROWSER_CHECK_EXACT:'只读核对：已有预约',BROWSER_CHECK_ABSENT:'只读核对：无本次预约',UNRESOLVED_SUBMISSION:'先核对未知提交',POSSIBLE_DUPLICATE:'疑似重复预约',ALREADY_BOOKED_ON_SERVER:'超星端已有本场预约',RECENT_DUPLICATE:'短时重复已跳过',LEGACY_SUCCESS:'旧成功记录待确认',SEAT_UNAVAILABLE:'座位不可预约',CAPTCHA_REQUIRED:'需要验证码',LOGIN_REQUIRED:'登录失效',SECURITY_CHALLENGE:'安全验证',BLOCKED_BY_RISK:'风控拦截',PLAN_OR_ACCOUNT_DISABLED:'计划或账号已停用',WEEKDAY_NOT_ENABLED:'今天不执行',INVALID_TIME_RANGE:'时段无效',NO_CANDIDATE_SEAT:'未配置座位',ACCOUNT_BUSY_TIMEOUT:'账号任务繁忙',DEADLINE_EXCEEDED:'超时',TARGET_DAY_NOT_OPEN:'目标日未开放',TARGET_CONTEXT_UNAVAILABLE:'未取得预约参数',SUBMIT_OUTCOME_UNKNOWN:'提交结果未知',TOKEN_STALE:'页面停留过久，自动刷新重试',SUBMIT_REJECTED:'平台拒绝',PROBE_COMPLETE:'参数检查完成',PROBE_WAITING_OPEN:'等待预约窗口开放',NETWORK_ERROR:'网络错误',SERVER_ERROR:'平台服务异常',HTTP_REDIRECT:'平台跳转，自动重试',RATE_LIMITED:'操作频繁，自动退避重试',UNEXPECTED_ERROR:'意外错误'};return map[code]||code||''} function triggerLabel(trigger){return trigger==='account_login'?'登录检查':trigger==='browser_trial'?'预约':trigger==='browser_preview'?'浏览器演练':trigger==='browser_recheck'?'只读核对':trigger==='probe'?'探测':trigger==='discover'?'自动发现':trigger==='scheduled'?'定时预约':trigger==='manual'?'手动预约':trigger==='manual_confirmed'?'确认后重抢':trigger} async function loadRuns(){const runs=await api('/api/runs');document.querySelector('#runs').innerHTML=runs.map(r=>`<tr><td data-label="北京时间">${escapeHtml(timeCN(r.started_at))}</td><td data-label="计划 / 账号">${escapeHtml(r.plan_name)}<br><small>${escapeHtml(r.account_name)} · ${escapeHtml(triggerLabel(r.trigger))}</small></td><td data-label="目标日 / 座位">${escapeHtml(r.target_date||'—')}<br><small>${escapeHtml(r.selected_seat||r.candidate_seats.join(' → ')||'—')}</small></td><td data-label="状态" class="status-${escapeHtml(r.status)}">${escapeHtml(runStatusLabel(r))}<br><small>${escapeHtml(errorCodeLabel(r.error_code))}</small></td><td data-label="消息">${escapeHtml(r.message||'')}${browserRunControls(r)}${r.parameter_source?`<br><small>参数来源：${escapeHtml(r.parameter_source)}</small>`:''}${renderProbeSeats(r.probe_results)}${(r.status==='NEEDS_VERIFICATION'&&['POSSIBLE_DUPLICATE','LEGACY_SUCCESS'].includes(r.error_code))?`<br><button type="button" onclick="confirmRunDuplicate(${r.id})">确认重抢</button>`:''}</td></tr>`).join('');await loadAccountStatus()}
+    async function loadBrowserStatus(){const state=await api('/api/browser/status');const el=document.querySelector('#browser-status');el.textContent=state.message;el.style.color=state.ready?'#15803d':'#b45309'}
+    function renderAccounts(accounts){document.querySelector('#accounts').innerHTML=accounts.map(a=>`<div class="plan-card"><strong>${escapeHtml(a.name)}</strong>（${escapeHtml(a.username)}）<span class="tag">${({READY:'已登录（最近检查）',WAITING_LOGIN:'等待登录',CHECKING:'检查中',ERROR:'检测失败',UNKNOWN:'待检查'})[a.login_status]||'待检查'}</span><p class="muted">${escapeHtml(a.login_message||'点击检查登录，不需要先创建计划')}${a.login_checked_at?`；最近检查 ${escapeHtml(timeCN(a.login_checked_at))}`:''}</p><button onclick="checkLogin(${a.id})" ${a.enabled?'':'disabled'}>检查登录／提前登录</button><button onclick="toggleAccount(${a.id},${!a.enabled})">${a.enabled?'停用':'启用'}</button><button onclick="delAccount(${a.id})">删除</button></div>`).join('')}
+    async function loadAccountStatus(){renderAccounts(await api('/api/accounts'))}
+    async function checkLogin(id){const result=await api(`/api/accounts/${id}/check-login`,{method:'POST'});showNotice('正在检查官方登录状态；需要操作时会显示该账号的原窗口。','success');await loadRuns();setTimeout(()=>guarded(()=>waitForRun(result.run_id))(),700)}
+    async function browserPreview(id){await startRun(id,'browser-preview')}
+    async function browserAction(id,action){const result=await api(`/api/runs/${id}/browser-${action}`,{method:'POST'});if(result.run_id){showNotice(`只读核对任务 #${result.run_id} 已启动。`,'success');setTimeout(()=>guarded(()=>waitForRun(result.run_id))(),700)}else showNotice(action==='focus'?'已请求显示原预约窗口。':action==='confirm-account'?'已确认账号，继续当前任务。':'已停止接管；可能已提交的预约将先核对结果。','success');await loadRuns()}
+    function browserRunControls(run){if(run.execution_mode!=='browser')return '';if(activeStatuses.includes(run.status)){const seconds=run.expires_at?Math.max(0,Math.ceil((Date.parse(run.expires_at)-Date.now())/1000)):null;return `<br><small>${seconds===null?'等待启动':`剩余等待 ${seconds} 秒`}</small><br><button onclick="browserAction(${run.id},'focus')">显示原窗口</button><button onclick="browserAction(${run.id},'cancel')">停止接管</button>${run.status==='WAITING_USER'&&(run.message||'').startsWith('请确认登录账号：')?`<button onclick="browserAction(${run.id},'confirm-account')">确认是本计划账号</button>`:''}`}return run.possibly_submitted||run.status==='NEEDS_VERIFICATION'?`<br><button onclick="browserAction(${run.id},'recheck')">只读核对预约</button>`:''}
     function confirmRunDuplicate(id){guarded(async()=>{const run=await api(`/api/runs/${id}`);showDuplicateConfirm(run)})()}
-    function resetPlan(){editingId=null;form.reset();candidateSeats=[];renderSeats();setSeatFeedback();closeBulkSeats();form.start_time.value='08:00';form.end_time.value='20:00';form.run_time.value='06:59';form.day_offset.value=1;form.max_attempts.value=3;form.enabled.checked=true;days.slice(0,5).forEach(day=>form.querySelector(`[name=weekdays][value=${day}]`).checked=true);selectParams=null;selectContextPath=null;selectContextSource=null;setSelectParamsView();const selectUrlInput=document.querySelector('#select-url');if(selectUrlInput)selectUrlInput.value='';document.querySelector('#save-plan').textContent='保存计划';document.querySelector('#cancel-edit').hidden=true}
+    function resetPlan(){editingId=null;form.reset();candidateSeats=[];renderSeats();setSeatFeedback();closeBulkSeats();form.start_time.value='08:00';form.end_time.value='20:00';form.run_time.value='06:59';form.day_offset.value=1;form.max_attempts.value=3;form.enabled.checked=true;form.execution_mode.value='browser';days.slice(0,5).forEach(day=>form.querySelector(`[name=weekdays][value=${day}]`).checked=true);selectParams=null;selectContextPath=null;selectContextSource=null;setSelectParamsView();const selectUrlInput=document.querySelector('#select-url');if(selectUrlInput)selectUrlInput.value='';document.querySelector('#save-plan').textContent='保存计划';document.querySelector('#cancel-edit').hidden=true}
     function planPayload(){if(!candidateSeats.length){setSeatFeedback('请至少添加一个候选座位。','error');seatEntry.focus();throw new Error('请至少添加一个候选座位。')}const data=Object.fromEntries(new FormData(form));delete data.seat_entry;data.account_id=Number(data.account_id);data.day_offset=Number(data.day_offset);data.max_attempts=Number(data.max_attempts);data.seats=[...candidateSeats];data.weekdays=[...form.querySelectorAll('[name=weekdays]:checked')].map(x=>x.value);data.enabled=form.enabled.checked;data.slider_enabled=false;data.select_params=selectParams?{...selectParams}:null;data.select_context_path=selectContextPath;data.select_context_source=selectContextSource;return data}
     async function savePlan(probeAfter){const buttons=[document.querySelector('#save-plan'),document.querySelector('#save-probe')];buttons.forEach(b=>{if(b)b.disabled=true});try{const data=planPayload();const plan=editingId?await api(`/api/plans/${editingId}`,{method:'PATCH',body:JSON.stringify(data)}):await api('/api/plans',{method:'POST',body:JSON.stringify(data)});resetPlan();await load();if(probeAfter)await probe(plan.id);else showNotice('计划已保存。','success')}finally{buttons.forEach(b=>{if(b)b.disabled=false})}}
     async function editPlan(id){const p=window.planCache[id];editingId=id;for(const key of ['account_id','name','room_id','start_time','end_time','run_time','day_offset'])form.elements[key].value=p[key];form.elements.max_attempts.value=Math.min(p.max_attempts,6);candidateSeats=[...p.seats];renderSeats();setSeatFeedback();form.enabled.checked=p.enabled;selectParams=p.select_params?{...p.select_params}:null;selectContextPath=p.select_context_path||null;selectContextSource=p.select_context_source||null;setSelectParamsView();const selectUrlInput=document.querySelector('#select-url');if(selectUrlInput)selectUrlInput.value='';days.forEach(day=>form.querySelector(`[name=weekdays][value=${day}]`).checked=p.weekdays.includes(day));document.querySelector('#save-plan').textContent='保存修改';document.querySelector('#cancel-edit').hidden=false;window.scrollTo({top:form.offsetTop-40,behavior:'smooth'})}
     async function delAccount(id){await api(`/api/accounts/${id}`,{method:'DELETE'});await load()}async function toggleAccount(id,enabled){await api(`/api/accounts/${id}`,{method:'PATCH',body:JSON.stringify({enabled})});await load()}async function togglePlan(id,enabled){await api(`/api/plans/${id}`,{method:'PATCH',body:JSON.stringify({enabled})});await load()}async function delPlan(id){await api(`/api/plans/${id}`,{method:'DELETE'});await load()}
-    async function waitForRun(runId,remaining=150,onDone=null){let run;try{run=await api(`/api/runs/${runId}`)}catch(error){showNotice(error.message||'任务状态查询失败');if(onDone)onDone();return}if(['PENDING','RUNNING'].includes(run.status)&&remaining>0){setTimeout(()=>waitForRun(runId,remaining-1,onDone),1000);return}await loadRuns();if(['PENDING','RUNNING'].includes(run.status)){showNotice(`任务 #${runId} 仍在队列中，请在运行记录查看状态。`,'error')}if(run.status==='NEEDS_VERIFICATION'&&['POSSIBLE_DUPLICATE','LEGACY_SUCCESS'].includes(run.error_code)){showDuplicateConfirm(run)}if(onDone)onDone()}
-    async function startRun(id,mode){hideDuplicateConfirm();const buttons=[...document.querySelectorAll(`button[onclick*="(${id})"]`)];buttons.forEach(b=>b.disabled=true);try{const result=await api(`/api/plans/${id}/${mode}`,{method:'POST'});showNotice(`任务 #${result.run_id} 已进入队列，正在检查。`,'success');setTimeout(()=>waitForRun(result.run_id,150,()=>buttons.forEach(b=>b.disabled=false)).catch(error=>{buttons.forEach(b=>b.disabled=false);showNotice(error.message||'任务状态查询失败')}),700)}catch(error){buttons.forEach(b=>b.disabled=false);throw error}} async function discoverPlan(id){await startRun(id,'discover')}async function probe(id){await startRun(id,'probe')}async function runPlan(id){await startRun(id,'run')}
+    async function waitForRun(runId,remaining=970,onDone=null){let run;try{run=await api(`/api/runs/${runId}`)}catch(error){showNotice(error.message||'任务状态查询失败');if(onDone)onDone();return}if(activeStatuses.includes(run.status)&&remaining>0){setTimeout(()=>waitForRun(runId,remaining-1,onDone),1000);return}await loadRuns();if(activeStatuses.includes(run.status)){showNotice(`任务 #${runId} 仍在队列中，请在运行记录查看状态。`,'error')}if(run.status==='NEEDS_VERIFICATION'&&['POSSIBLE_DUPLICATE','LEGACY_SUCCESS'].includes(run.error_code)){showDuplicateConfirm(run)}if(onDone)onDone()}
+    async function startRun(id,mode){hideDuplicateConfirm();const buttons=[...document.querySelectorAll(`button[onclick*="(${id})"]`)];buttons.forEach(b=>b.disabled=true);try{const result=await api(`/api/plans/${id}/${mode}`,{method:'POST'});showNotice(`任务 #${result.run_id} 已进入队列，正在检查。`,'success');setTimeout(()=>waitForRun(result.run_id,970,()=>buttons.forEach(b=>b.disabled=false)).catch(error=>{buttons.forEach(b=>b.disabled=false);showNotice(error.message||'任务状态查询失败')}),700)}catch(error){buttons.forEach(b=>b.disabled=false);throw error}} async function discoverPlan(id){await startRun(id,'discover')}async function probe(id){await startRun(id,'probe')}async function runPlan(id){await startRun(id,'run')}
     async function confirmDuplicate(){if(!pendingDuplicateRunId)return;const button=document.querySelector('#confirm-duplicate');button.disabled=true;try{const result=await api(`/api/runs/${pendingDuplicateRunId}/confirm-duplicate`,{method:'POST'});hideDuplicateConfirm();showNotice(`已确认，任务 #${result.run_id} 正在执行。`,'success');setTimeout(()=>guarded(()=>waitForRun(result.run_id))(),700)}finally{button.disabled=false}} function cancelDuplicate(){hideDuplicateConfirm();showNotice('已取消本次重复预约确认。','success')}
     document.querySelector('#add-seat').addEventListener('click',addSingleSeat);seatEntry.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addSingleSeat()}});form.elements.room_id.addEventListener('input',event=>{const boundRoom=String(selectParams&&selectParams.id||'').trim();if(boundRoom&&boundRoom!==String(event.target.value||'').trim()){selectParams=null;selectContextPath=null;selectContextSource=null;setSelectParamsView();showNotice('阅览室已变更，已清除旧预约参数；请重新自动发现。','success')}});document.querySelector('#toggle-bulk-seats').addEventListener('click',()=>{bulkSeats.hidden=!bulkSeats.hidden;if(!bulkSeats.hidden)bulkSeatEntry.focus()});document.querySelector('#cancel-bulk-seats').addEventListener('click',closeBulkSeats);document.querySelector('#confirm-bulk-seats').addEventListener('click',()=>{const values=bulkSeatEntry.value.split(/[,，;；\s]+/).filter(Boolean);if(!values.length){setSeatFeedback('请先粘贴至少一个座位号。','error');bulkSeatEntry.focus();return}if(addSeatValues(values))closeBulkSeats()});seatList.addEventListener('click',event=>{const button=event.target.closest('[data-seat-action]');if(!button)return;const index=Number(button.dataset.seatIndex);if(button.dataset.seatAction==='remove'){const [seat]=candidateSeats.splice(index,1);renderSeats();setSeatFeedback(`已删除座位 ${seat}。`,'success')}else if(button.dataset.seatAction==='up')moveSeat(index,index-1);else if(button.dataset.seatAction==='down')moveSeat(index,index+1)});seatList.addEventListener('dragstart',event=>{const item=event.target.closest('[data-seat-index]');if(!item)return;draggingSeatIndex=Number(item.dataset.seatIndex);item.classList.add('dragging');event.dataTransfer.effectAllowed='move'});seatList.addEventListener('dragover',event=>{if(draggingSeatIndex!==null)event.preventDefault()});seatList.addEventListener('drop',event=>{event.preventDefault();const item=event.target.closest('[data-seat-index]');if(!item||draggingSeatIndex===null)return;const targetIndex=Number(item.dataset.seatIndex),from=draggingSeatIndex;draggingSeatIndex=null;const [seat]=candidateSeats.splice(from,1);candidateSeats.splice(from<targetIndex?targetIndex-1:targetIndex,0,seat);renderSeats();setSeatFeedback(`已调整座位 ${seat} 的优先顺序。`,'success')});seatList.addEventListener('dragend',()=>{draggingSeatIndex=null;seatList.querySelectorAll('.dragging').forEach(item=>item.classList.remove('dragging'))});
-    document.querySelector('#parse-select-url').addEventListener('click',guarded(parseSelectUrl));document.querySelector('#select-url').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();guarded(parseSelectUrl)()}});document.querySelector('#save-notify').addEventListener('click',guarded(saveNotify));document.querySelector('#test-notify').addEventListener('click',guarded(testNotify));document.querySelector('#account-form').addEventListener('submit',guarded(async event=>{event.preventDefault();const f=event.target;await api('/api/accounts',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(f)))});f.reset();await load();showNotice('账号已保存。','success')}));form.addEventListener('submit',guarded(async event=>{event.preventDefault();await savePlan(false)}));document.querySelector('#save-probe').addEventListener('click',guarded(()=>savePlan(true)));document.querySelector('#cancel-edit').addEventListener('click',resetPlan);document.querySelector('#cancel-duplicate').addEventListener('click',cancelDuplicate);document.querySelector('#confirm-duplicate').addEventListener('click',guarded(confirmDuplicate));document.querySelector('#refresh-runs').addEventListener('click',guarded(loadRuns));window.delAccount=guarded(delAccount);window.toggleAccount=guarded(toggleAccount);window.togglePlan=guarded(togglePlan);window.delPlan=guarded(delPlan);window.editPlan=editPlan;window.discoverPlan=guarded(discoverPlan);window.probe=guarded(probe);window.runPlan=guarded(runPlan);window.confirmRunDuplicate=confirmRunDuplicate;resetPlan();guarded(load)();
+    document.querySelector('#parse-select-url').addEventListener('click',guarded(parseSelectUrl));document.querySelector('#select-url').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();guarded(parseSelectUrl)()}});document.querySelector('#save-notify').addEventListener('click',guarded(saveNotify));document.querySelector('#test-notify').addEventListener('click',guarded(testNotify));document.querySelector('#account-form').addEventListener('submit',guarded(async event=>{event.preventDefault();const f=event.target;await api('/api/accounts',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(f)))});f.reset();await load();showNotice('账号已保存。','success')}));form.addEventListener('submit',guarded(async event=>{event.preventDefault();await savePlan(false)}));document.querySelector('#save-probe').addEventListener('click',guarded(()=>savePlan(true)));document.querySelector('#cancel-edit').addEventListener('click',resetPlan);document.querySelector('#cancel-duplicate').addEventListener('click',cancelDuplicate);document.querySelector('#confirm-duplicate').addEventListener('click',guarded(confirmDuplicate));document.querySelector('#refresh-runs').addEventListener('click',guarded(loadRuns));window.delAccount=guarded(delAccount);window.toggleAccount=guarded(toggleAccount);window.togglePlan=guarded(togglePlan);window.delPlan=guarded(delPlan);window.editPlan=editPlan;window.discoverPlan=guarded(discoverPlan);window.probe=guarded(probe);window.runPlan=guarded(runPlan);window.checkLogin=guarded(checkLogin);window.browserPreview=guarded(browserPreview);window.browserAction=guarded(browserAction);window.confirmRunDuplicate=confirmRunDuplicate;document.querySelector('#browser-check').addEventListener('click',guarded(loadBrowserStatus));resetPlan();guarded(load)();
     // 运行记录自动刷新：到点执行时无需手动刷新即可看到新记录出现。
     function pollRuns(){if(document.visibilityState==='visible')loadRuns().catch(()=>{})}
     setInterval(pollRuns,5000);document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')pollRuns()});

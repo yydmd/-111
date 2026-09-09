@@ -26,6 +26,8 @@ from typing import IO
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from app.run_state import ACTIVE_STATUSES, live_browser_run
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 PYTHON = PYTHON if PYTHON.exists() else Path(sys.executable)
 SERVICE_COMMAND = [str(PYTHON), "-u", "main.py", "-m", "serve"]
@@ -173,15 +175,23 @@ def has_recent_active_run() -> bool:
     try:
         connection = sqlite3.connect(f"file:{ROOT / 'data' / 'app.db'}?mode=ro", uri=True, timeout=1)
         try:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(reservation_runs)")}
+            extra = "heartbeat_at, expires_at" if {"heartbeat_at", "expires_at"} <= columns else "NULL, NULL"
+            marks = ",".join("?" for _ in ACTIVE_STATUSES)
             rows = connection.execute(
-                "SELECT started_at FROM reservation_runs WHERE status IN ('PENDING', 'RUNNING')"
+                f"SELECT started_at, {extra} FROM reservation_runs WHERE status IN ({marks})", ACTIVE_STATUSES
             ).fetchall()
         finally:
             connection.close()
     except sqlite3.Error:
         return False
     now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
-    for (started_at,) in rows:
+    for started_at, heartbeat, expires in rows:
+        try:
+            if live_browser_run(heartbeat, expires, now):
+                return True
+        except (ValueError, TypeError):
+            pass
         try:
             started = dt.datetime.fromisoformat(str(started_at)).replace(tzinfo=None)
         except ValueError:

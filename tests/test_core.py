@@ -175,7 +175,7 @@ def _make_plan(session_factory, account_id=1, seats=("001", "002", "003"), max_a
     account = db.get(Account, account_id)
     if account is None:
         account = Account(id=account_id, name=f"account-{account_id}", username=f"user-{account_id}", password_blob=b"test")
-    plan = ReservationPlan(account=account, name=f"plan-{account_id}", room_id="100", start_time="08:00", end_time="09:00", run_time="06:00", day_offset=1, weekdays_json='["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]', max_attempts=max_attempts, enabled=True)
+    plan = ReservationPlan(account=account, execution_mode="api", name=f"plan-{account_id}", room_id="100", start_time="08:00", end_time="09:00", run_time="06:00", day_offset=1, weekdays_json='["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]', max_attempts=max_attempts, enabled=True)
     plan.seats = [PlanSeat(seat_num=seat, priority=index) for index, seat in enumerate(seats)]
     db.add(plan)
     db.commit()
@@ -717,7 +717,7 @@ def test_v5_database_migrates_context_and_attempt_audit_columns(tmp_path, monkey
     monkeypatch.setattr(db_module, "DATA_DIR", tmp_path)
     db_module._migrate_database()
     connection = sqlite3.connect(database_path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
     plan_columns = {row[1] for row in connection.execute("PRAGMA table_info(reservation_plans)")}
     run_columns = {row[1] for row in connection.execute("PRAGMA table_info(reservation_runs)")}
     assert {"select_context_source", "select_context_path", "select_context_checked_at"} <= plan_columns
@@ -746,7 +746,7 @@ def test_migration_v8_normalizes_legacy_absolute_context_path(tmp_path, monkeypa
     monkeypatch.setattr(db_module, "DATA_DIR", tmp_path)
     db_module._migrate_database()
     connection = sqlite3.connect(database_path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
     assert connection.execute("SELECT select_context_path FROM reservation_plans WHERE id=1").fetchone()[0] == "/front/third/apps/seat/select"
     connection.close()
 
@@ -916,7 +916,9 @@ def test_startup_catchup_enqueues_once_for_a_recently_missed_schedule(tmp_path, 
     assert scheduler_module._enqueue_recently_missed_jobs(now) == 1
     assert queued == [(plan_id, "scheduled_catchup")]
     db = factory()
-    db.add(ReservationRun(plan_id=plan_id, target_date="2026-09-08", trigger="scheduled", status="SUCCESS", message="done"))
+    db.add(ReservationRun(plan_id=plan_id, target_date="2026-09-08",
+                          request_fingerprint="2026-09-08|100|08:00|09:00",
+                          trigger="scheduled", status="SUCCESS", message="done"))
     db.commit()
     db.close()
     assert scheduler_module._enqueue_recently_missed_jobs(now) == 0
@@ -1066,15 +1068,15 @@ def test_duplicate_absent_on_server_proceeds_with_reservation(tmp_path, monkeypa
     db.close()
 
 
-def test_fire_time_of_day_leads_by_thirty_seconds_with_midnight_clamp():
+def test_fire_time_of_day_leads_by_ten_minutes_across_midnight():
     from app.scheduler import _fire_time_of_day, LEAD_SECONDS
 
-    assert _fire_time_of_day("07:30") == (7, 29, 30)
-    assert _fire_time_of_day("00:10") == (0, 9, 30)
+    assert _fire_time_of_day("07:30") == (7, 20, 0)
+    assert _fire_time_of_day("00:10") == (0, 0, 0)
     # Inside the lead window after midnight we fire exactly on the minute
     # instead of shifting the weekday to the previous day.
-    assert _fire_time_of_day("00:00") == (0, 0, 0)
-    assert LEAD_SECONDS == 30
+    assert _fire_time_of_day("00:00") == (23, 50, 0)
+    assert LEAD_SECONDS == 600
 
 
 def test_submit_once_with_pre_resolved_probe_skips_page_resolution(monkeypatch):
@@ -1480,6 +1482,24 @@ def test_plan_save_refreshes_jobs_and_runs_recent_miss_catchup(tmp_path, monkeyp
     db.close()
 
 
+def test_reenabling_account_runs_recent_miss_catchup(tmp_path, monkeypatch):
+    """账号恢复启用后，今天已过准备时刻的计划仍进入补跑检查。"""
+    import app.web as web
+
+    factory = _test_session_factory(tmp_path)
+    db = factory()
+    db.add(Account(id=1, name="a", username="u", password_blob=b"x", enabled=False))
+    db.commit()
+    calls = []
+    monkeypatch.setattr(web, "refresh_jobs", lambda: calls.append("refresh"))
+    monkeypatch.setattr(web, "_enqueue_recently_missed_jobs", lambda: calls.append("catchup"))
+    web.patch_account(1, web.AccountPatch(enabled=True), db)
+    assert calls == ["refresh", "catchup"]
+    web.patch_account(1, web.AccountPatch(name="renamed"), db)
+    assert calls == ["refresh", "catchup", "refresh"]
+    db.close()
+
+
 def test_submit_once_classifies_stale_page_as_token_stale(monkeypatch):
     """修复回归：平台 303（请刷新后再提交）是可恢复拒绝，不是终局风控。"""
     client = ChaoxingClient("u", "p")
@@ -1680,7 +1700,9 @@ def test_catchup_after_failed_run_still_enqueues(tmp_path, monkeypatch):
     assert queued == [(plan_id, "scheduled_catchup")]
     # 已成功的记录仍然阻塞补跑（当天真的订上了就没有再跑的意义）。
     db = factory()
-    db.add(ReservationRun(plan_id=plan_id, account_id=1, target_date="2026-09-08", trigger="scheduled", status="SUCCESS", message="done"))
+    db.add(ReservationRun(plan_id=plan_id, account_id=1, target_date="2026-09-08",
+                          request_fingerprint="2026-09-08|100|08:00|09:00",
+                          trigger="scheduled", status="SUCCESS", message="done"))
     db.commit()
     db.close()
     assert scheduler_module._enqueue_recently_missed_jobs(now) == 0
@@ -1727,8 +1749,7 @@ def test_plan_rejects_run_time_before_half_past_midnight():
     import app.web as web
 
     base = {"account_id": 1, "name": "p", "room_id": "10713", "seats": ["097"], "start_time": "08:00", "end_time": "08:30"}
-    with pytest.raises(Exception):
-        web.PlanData.model_validate({**base, "run_time": "00:10"})
+    assert web.PlanData.model_validate({**base, "run_time": "00:10"}).run_time == "00:10"
     accepted = web.PlanData.model_validate({**base, "run_time": "00:30"})
     assert accepted.run_time == "00:30"
 
@@ -1984,13 +2005,62 @@ def test_next_run_at_reads_live_scheduler():
         value = web._next_run_at(plan_stub)
         assert value is not None
         parsed = datetime.fromisoformat(value)
-        assert abs((parsed - (fire_moment + timedelta(seconds=30))).total_seconds()) < 1
+        assert abs((parsed - (fire_moment + timedelta(seconds=600))).total_seconds()) < 1
     finally:
         try:
             web.scheduler.remove_job("plan-999911")
         except Exception:
             pass
         web.scheduler.shutdown(wait=False)
+
+
+def test_next_run_at_shows_today_during_catchup_window():
+    """准备时刻已过但执行时刻仍在今天时，页面不能跳成明天。"""
+    from types import SimpleNamespace
+
+    import app.web as web
+    from apscheduler.triggers.date import DateTrigger
+
+    now = datetime(2026, 9, 9, 7, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
+    tomorrow_job = datetime(2026, 9, 10, 7, 32, tzinfo=ZoneInfo("Asia/Shanghai"))
+    plan = SimpleNamespace(id=999912, enabled=True, run_time="07:42",
+                           weekdays=["Wednesday"])
+    try:
+        web.scheduler.start(paused=True)
+        web.scheduler.add_job(lambda: None, DateTrigger(run_date=tomorrow_job),
+                              id="plan-999912", replace_existing=True)
+        assert datetime.fromisoformat(web._next_run_at(plan, now)).date() == now.date()
+    finally:
+        try:
+            web.scheduler.remove_job("plan-999912")
+        except Exception:
+            pass
+        web.scheduler.shutdown(wait=False)
+
+
+def test_catchup_success_dedupe_uses_current_reservation_intent(tmp_path, monkeypatch):
+    """同一天旧时段的成功记录不能吞掉编辑后新时段的任务。"""
+    import app.scheduler as scheduler_module
+
+    factory = _test_session_factory(tmp_path)
+    plan_id = _make_plan(factory, seats=("001",), max_attempts=1)
+    with factory() as db:
+        plan = db.get(ReservationPlan, plan_id)
+        plan.run_time = "08:00"
+        plan.day_offset = 0
+        plan.weekdays_json = '["Monday"]'
+        db.add(ReservationRun(plan_id=plan_id, account_id=1,
+                              target_date="2026-09-07",
+                              request_fingerprint="2026-09-07|100|07:00|08:00",
+                              trigger="scheduled", status="SUCCESS", message="old intent"))
+        db.commit()
+    queued = []
+    monkeypatch.setattr(scheduler_module, "SessionLocal", factory)
+    monkeypatch.setattr(scheduler_module, "enqueue_plan",
+                        lambda plan_id, trigger: queued.append((plan_id, trigger)) or 1)
+    now = datetime(2026, 9, 7, 7, 55, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert scheduler_module._enqueue_recently_missed_jobs(now) == 1
+    assert queued == [(plan_id, "scheduled_catchup")]
 
 
 def test_volley_racer_heals_token_stale_in_place(tmp_path, monkeypatch):
