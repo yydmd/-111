@@ -49,6 +49,17 @@ def test_covering_interval_requires_review_and_adjacent_does_not_overlap():
     assert br.reservation_match([partial], VALUES, DAY)[0] == "conflict"
 
 
+def test_covering_interval_is_confirmed_when_this_submit_extended_an_adjacent_record():
+    tz = dt.timezone(dt.timedelta(hours=8))
+    epoch = lambda hour, minute: int(dt.datetime(2026, 9, 10, hour, minute, tzinfo=tz).timestamp() * 1000)
+    before = [record(startTime=epoch(8, 0), endTime=epoch(8, 30))]
+    after = [record(startTime=epoch(8, 0), endTime=epoch(9, 30))]
+    state, seat, detail = br.reservation_match(after, VALUES, DAY, before)
+    assert (state, seat) == ("exact", "097")
+    assert "提交前相邻预约" in detail
+    assert br.reservation_match(after, VALUES, DAY, before + [record()])[0] == "conflict"
+
+
 def test_passport_identity_is_available_before_office_app_opens():
     passport = [{"name": "_uid", "value": "42"}]
     office = passport + [{"name": "oa_uid", "value": "42"}]
@@ -217,6 +228,51 @@ def test_real_persistent_browser_launch(tmp_path):
             session.detach()
         finally:
             context.close()
+
+
+def test_native_window_raise_uses_topmost_fallback_when_activation_is_blocked():
+    class User32:
+        def __init__(self):
+            self.calls = []
+            self.activations = iter((False, True))
+
+        def ShowWindow(self, hwnd, state):
+            self.calls.append(("restore", hwnd, state))
+
+        def BringWindowToTop(self, hwnd):
+            self.calls.append(("raise", hwnd))
+
+        def SetForegroundWindow(self, hwnd):
+            self.calls.append(("activate", hwnd))
+            return next(self.activations)
+
+        def SetWindowPos(self, hwnd, after, *args):
+            self.calls.append(("zorder", hwnd, after))
+
+    user32 = User32()
+    assert br._raise_native_window(user32, 123, "topmost", "notopmost")
+    assert user32.calls == [
+        ("restore", 123, 9),
+        ("raise", 123),
+        ("activate", 123),
+        ("zorder", 123, "topmost"),
+        ("zorder", 123, "notopmost"),
+        ("raise", 123),
+        ("activate", 123),
+    ]
+
+
+def test_native_window_raise_avoids_zorder_bounce_when_activation_works():
+    class User32:
+        def __init__(self): self.calls = []
+        def ShowWindow(self, hwnd, state): self.calls.append("restore")
+        def BringWindowToTop(self, hwnd): self.calls.append("raise")
+        def SetForegroundWindow(self, hwnd): self.calls.append("activate"); return True
+        def SetWindowPos(self, *args): self.calls.append("zorder")
+
+    user32 = User32()
+    assert br._raise_native_window(user32, 123, "topmost", "notopmost")
+    assert user32.calls == ["restore", "raise", "activate"]
 
 
 @pytest.fixture
@@ -392,7 +448,8 @@ def test_official_not_open_notice_is_not_a_login_or_adapter_failure(page_fixture
     ("qr_confirm", "PROBE_DONE"), ("qr_slow", "PROBE_DONE"),
     ("qr_cancel", "SKIPPED"), ("qr_changed", "SKIPPED"),
     ("scheduled_open", "SUCCESS"), ("existing_disabled", "SKIPPED"), ("early_captcha", "SUCCESS"),
-    ("list_delay", "SUCCESS"), ("merged", "NEEDS_VERIFICATION"), ("seat_fallback", "SUCCESS"),
+    ("list_delay", "SUCCESS"), ("merged", "NEEDS_VERIFICATION"),
+    ("adjacent_merge", "SUCCESS"), ("seat_fallback", "SUCCESS"),
     ("response_captcha", "SUCCESS"), ("late_response_captcha", "SUCCESS"), ("direct_submit", "SUCCESS"),
     ("scheduled_direct", "SUCCESS"), ("scheduled_stale_date", "SUCCESS")])
 def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, monkeypatch, mode, expected):
@@ -419,6 +476,11 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
                     items = [record(
                         startTime=int(dt.datetime(2026, 9, 10, 8, 0, tzinfo=tz).timestamp() * 1000),
                         endTime=int(dt.datetime(2026, 9, 10, 10, 0, tzinfo=tz).timestamp() * 1000))]
+                if mode == 'adjacent_merge':
+                    tz = dt.timezone(dt.timedelta(hours=8))
+                    items = [record(
+                        startTime=int(dt.datetime(2026, 9, 10, 8, 0, tzinfo=tz).timestamp() * 1000),
+                        endTime=int(dt.datetime(2026, 9, 10, 9 if sent else 8, 30, tzinfo=tz).timestamp() * 1000))]
                 if mode == 'seat_fallback' and len(sent) == 2:
                     items = [record(seatNum='098')]
                 return SimpleNamespace(status=200, json=lambda: {"success": True, "data": {"curReserves": items}})
@@ -556,13 +618,15 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
     result = br.run_browser(42, 1, values, DAY, fire_epoch, checkpoint,
                            preview=mode == "preview" or mode.startswith("qr_"), check_only=mode == "recheck")
     assert result.status == expected, result
-    assert len(sent) == (2 if mode in {'seat_fallback', 'response_captcha', 'late_response_captcha'} else 1 if mode in {"success", "unknown", "scheduled_open", "scheduled_direct", "scheduled_stale_date", "direct_submit", "early_captcha", "list_delay", "merged"} else 0)
+    assert len(sent) == (2 if mode in {'seat_fallback', 'response_captcha', 'late_response_captcha'} else 1 if mode in {"success", "unknown", "scheduled_open", "scheduled_direct", "scheduled_stale_date", "direct_submit", "early_captcha", "list_delay", "merged", "adjacent_merge"} else 0)
     if mode == 'list_delay':
         assert list_reads_after_send[0] == 2
     if mode == 'seat_fallback':
         assert [parse_qs(body)['seatNum'][0] for body in sent] == ['097', '098']
     if mode == 'merged':
         assert result.code == 'BROWSER_RESERVATION_CONFLICT'
+    if mode == 'adjacent_merge':
+        assert result.code is None and '提交前相邻预约' in result.message
     if mode in {"scheduled_open", "scheduled_direct", "scheduled_stale_date"}:
         assert len(navigations) == 2
     if mode in {"direct_submit", "scheduled_direct", "scheduled_stale_date"}:

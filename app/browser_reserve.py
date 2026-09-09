@@ -131,6 +131,24 @@ def window_state(page, foreground=False):
             page.bring_to_front()
 
 
+def _raise_native_window(user32, hwnd, topmost, notopmost):
+    """Restore an owned browser window even when Windows rejects activation.
+
+    Background processes are sometimes refused by ``SetForegroundWindow``.
+    In that case a short topmost/not-topmost bounce still makes the verification
+    window visible without leaving it permanently above the user's other apps.
+    """
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.BringWindowToTop(hwnd)
+    if user32.SetForegroundWindow(hwnd):
+        return True
+    flags = 0x0001 | 0x0002 | 0x0040  # SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+    user32.SetWindowPos(hwnd, topmost, 0, 0, 0, 0, flags)
+    user32.SetWindowPos(hwnd, notopmost, 0, 0, 0, 0, flags)
+    user32.BringWindowToTop(hwnd)
+    return bool(user32.SetForegroundWindow(hwnd))
+
+
 def _flash_owned_window(page):
     if os.name != 'nt':
         return
@@ -150,16 +168,22 @@ def _flash_owned_window(page):
         user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,ctypes.POINTER(wintypes.DWORD)]
         user32.IsWindowVisible.argtypes = [wintypes.HWND]
         user32.ShowWindow.argtypes = [wintypes.HWND,ctypes.c_int]
+        user32.BringWindowToTop.argtypes = [wintypes.HWND]
         user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetWindowPos.argtypes = [wintypes.HWND,wintypes.HWND,ctypes.c_int,ctypes.c_int,
+                                       ctypes.c_int,ctypes.c_int,wintypes.UINT]
         user32.FlashWindowEx.argtypes = [ctypes.POINTER(FLASHWINFO)]
+        topmost, notopmost = wintypes.HWND(-1), wintypes.HWND(-2)
         def visit(hwnd, _):
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd,ctypes.byref(pid))
             if pid.value == browser_pid and user32.IsWindowVisible(hwnd):
-                user32.ShowWindow(hwnd,9)
-                user32.SetForegroundWindow(hwnd)
-                info = FLASHWINFO(ctypes.sizeof(FLASHWINFO),hwnd,3,3,0)
-                user32.FlashWindowEx(ctypes.byref(info))
+                focused = _raise_native_window(user32, hwnd, topmost, notopmost)
+                if not focused:
+                    # Keep flashing until the user opens the window. Three
+                    # short flashes were easy to miss during an opening race.
+                    info = FLASHWINFO(ctypes.sizeof(FLASHWINFO),hwnd,0x0000000F,0,0)
+                    user32.FlashWindowEx(ctypes.byref(info))
                 return False
             return True
         callback = callback_type(visit)
@@ -256,28 +280,42 @@ def opening_notice(page) -> bool:
     return any(text in body for text in ("当前区域未到开放预约时间", "该区域未到开放预约时间"))
 
 
-def reservation_match(items: list, values: dict, day: str) -> tuple[str, str | None, str]:
+def reservation_match(
+    items: list,
+    values: dict,
+    day: str,
+    previous_items: list | None = None,
+) -> tuple[str, str | None, str]:
     """Confirm only an exact official record for the requested interval.
 
     A wider envelope shown by the reservation list is not proof that every
-    half-hour inside it was actually booked. It is therefore evidence that
-    needs review, never success evidence.
+    half-hour inside it was actually booked. It normally needs review. One
+    exception is a post-submit record that exactly extends an official record
+    captured immediately before submission by this run: the before/after pair
+    proves that the requested adjacent interval was merged by the platform.
     """
     tz = dt.timezone(dt.timedelta(hours=8))
     start = dt.datetime.fromisoformat(day + "T" + values["start_time"]).replace(tzinfo=tz)
     end = dt.datetime.fromisoformat(day + "T" + values["end_time"]).replace(tzinfo=tz)
+    def parse(item):
+        if not isinstance(item, dict):
+            raise ValueError("bad item")
+        a = dt.datetime.fromtimestamp(int(item["startTime"]) / 1000, tz)
+        b = dt.datetime.fromtimestamp(int(item["endTime"]) / 1000, tz)
+        item_day = str(item["today"])
+        seat = normalize_seat(str(item["seatNum"]))
+        room = str(item["roomId"])
+        if b <= a or a.date().isoformat() != item_day:
+            raise ValueError("bad interval")
+        return a, b, item_day, seat, room
+    try:
+        previous = [parse(item) for item in previous_items] if previous_items is not None else None
+    except (KeyError, ValueError, TypeError, OverflowError, OSError):
+        return "unavailable", None, "提交前预约列表缺少日期、座位或有效起止时间"
     exact, conflicts = [], []
     for item in items:
-        if not isinstance(item, dict):
-            return "unavailable", None, "预约列表包含无法识别的记录"
         try:
-            a = dt.datetime.fromtimestamp(int(item["startTime"]) / 1000, tz)
-            b = dt.datetime.fromtimestamp(int(item["endTime"]) / 1000, tz)
-            item_day = str(item["today"])
-            seat = normalize_seat(str(item["seatNum"]))
-            room = str(item["roomId"])
-            if b <= a or a.date().isoformat() != item_day:
-                raise ValueError("bad interval")
+            a, b, item_day, seat, room = parse(item)
         except (KeyError, ValueError, TypeError, OverflowError, OSError):
             return "unavailable", None, "预约列表缺少日期、座位或有效起止时间"
         if a < end and b > start:
@@ -285,6 +323,23 @@ def reservation_match(items: list, values: dict, day: str) -> tuple[str, str | N
             if (item_day == day and a == start and b == end and
                     room == values["room_id"] and seat in values["seats"]):
                 exact.append((seat, description))
+            elif (previous is not None and item_day == day and room == values["room_id"]
+                    and seat in values["seats"] and a <= start and b >= end
+                    and (a < start or b > end)):
+                adjacent = [(pa, pb) for pa, pb, pd, ps, pr in previous
+                            if pd == day and ps == seat and pr == room
+                            and (pb <= start or pa >= end)]
+                previous_overlap = any(
+                    pd == day and ps == seat and pr == room and pa < end and pb > start
+                    for pa, pb, pd, ps, pr in previous
+                )
+                left_proven = a == start or any(pa == a and pb == start for pa, pb in adjacent)
+                right_proven = b == end or any(pa == end and pb == b for pa, pb in adjacent)
+                if not previous_overlap and left_proven and right_proven:
+                    exact.append((seat, description +
+                                  f"（由提交前相邻预约与本次 {start:%H:%M}–{end:%H:%M} 合并）"))
+                else:
+                    conflicts.append(description)
             else:
                 conflicts.append(description)
     if conflicts or len(exact) > 1:
@@ -516,6 +571,8 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
     managed = current_session()
     last_state = None
     checking_login = False
+    last_lookup_items = None
+    submission_baseline = None
 
     def identity():
         # Persist only a hash binding, never an authentication token. This also
@@ -590,7 +647,8 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
         if bound_identity and not checking and identity() != bound_identity:
             raise InterruptedError("浏览器登录账号发生变化，已停止接管")
 
-    def lookup(timeout=5000):
+    def lookup(timeout=5000, previous_items=None):
+        nonlocal last_lookup_items
         if not bound_identity or identity() != bound_identity:
             return "unavailable", None, "浏览器账号尚未核实或已变化，不能核对另一账号的预约"
         if not fid:
@@ -605,8 +663,10 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
             items = (payload.get("data") or {}).get("curReserves")
             if not isinstance(items, list):
                 raise ValueError("invalid list")
-            return reservation_match(items, values, day)
+            last_lookup_items = [dict(item) if isinstance(item, dict) else item for item in items]
+            return reservation_match(items, values, day, previous_items)
         except Exception:
+            last_lookup_items = None
             return "unavailable", None, "无法读取同一浏览器会话的官方预约记录"
 
     def reconcile(*, allow_challenge=False):
@@ -619,7 +679,10 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
             if allow_challenge and gate.challenge_pending:
                 return None
             tick("VERIFYING", "正在核对官方预约记录，不会重复提交", checking=True)
-            state, seat, detail = lookup(timeout=max(1, min(5000, int((until - time.monotonic()) * 1000))))
+            state, seat, detail = lookup(
+                timeout=max(1, min(5000, int((until - time.monotonic()) * 1000))),
+                previous_items=submission_baseline,
+            )
             if allow_challenge and gate.challenge_pending:
                 return None
             if state == "exact":
@@ -841,6 +904,7 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
                         return BrowserResult("SKIPPED", "ALREADY_BOOKED_ON_SERVER", detail, held_seat)
                     if existing != "absent":
                         return BrowserResult("NEEDS_VERIFICATION", "BROWSER_PRECHECK_FAILED", detail)
+                    submission_baseline = last_lookup_items
                     # Re-read all selected values after waiting/user interaction.
                     button, fid = adapter.prepare(values, day, seat)
                     tick("RUNNING", f"准备预约座位 {seat}")
