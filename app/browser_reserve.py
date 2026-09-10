@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter_ns
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import clock
@@ -32,6 +33,10 @@ ACCOUNT_URL = "https://passport2.chaoxing.com/mooc/accountManage"
 logger = logging.getLogger(__name__)
 SUBMIT_PATH = "/data/apps/seat/submit"
 READ_SEAT_PATHS = {"index", "room/info", "room/info/switch", "getusedtimes", "getusedseatnums", "address", "captcha"}
+REQUEST_GATE_PATTERNS = (
+    "https://passport2.chaoxing.com/fanyalogin**",
+    ORIGIN + "/data/apps/seat/**",
+)
 
 
 @dataclass
@@ -40,6 +45,7 @@ class BrowserResult:
     code: str | None
     message: str
     seat: str | None = None
+    attempt_timings: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -113,6 +119,17 @@ def launch_context(pw, profile):
     if channel:
         options["channel"] = channel
     return pw.chromium.launch_persistent_context(str(profile), **options)
+
+
+def install_request_gate(context, gate) -> None:
+    """Intercept only login and seat mutations, leaving risk/static traffic native."""
+    for pattern in REQUEST_GATE_PATTERNS:
+        context.route(pattern, gate.route)
+
+
+def remove_request_gate(context, gate) -> None:
+    for pattern in REQUEST_GATE_PATTERNS:
+        context.unroute(pattern, gate.route)
 
 
 def window_state(page, foreground=False):
@@ -350,7 +367,7 @@ def reservation_match(
 
 
 class RequestGate:
-    def __init__(self, values, day, preview, checkpoint, control, deadline):
+    def __init__(self, values, day, preview, checkpoint, control, deadline, timing_sink=None):
         self.values, self.day, self.preview = values, day, preview
         self.checkpoint, self.control, self.deadline = checkpoint, control, deadline
         self.armed_seat = None
@@ -362,9 +379,22 @@ class RequestGate:
         self.challenge_pending = False
         self.challenge_message = ""
         self.blocked_reason = ""
+        self.terminal_code = None
+        self.terminal_message = ""
         self.login_ok = False
         self.login_matches = False
         self.identity_check = lambda: True
+        self.attempt_timings = timing_sink if timing_sink is not None else []
+        self._click_started_ns = None
+        self._active_timing = None
+
+    def mark_click(self, seat: str) -> None:
+        self._click_started_ns = perf_counter_ns()
+
+    def _mark_response(self) -> None:
+        timing = self._active_timing
+        if timing is not None and "request_to_response_ms" not in timing:
+            timing["request_to_response_ms"] = (perf_counter_ns() - timing["_route_finished_ns"]) / 1_000_000
 
     def route(self, route):
         request = route.request
@@ -390,6 +420,8 @@ class RequestGate:
             else:
                 route.fallback()
             return
+        route_started_ns = perf_counter_ns()
+        released = False
         if self.preview or self.control.cancel.is_set() or time.monotonic() >= self.deadline:
             route.abort()
             return
@@ -437,11 +469,24 @@ class RequestGate:
             self.sent_seat = self.armed_seat
             self.attempted.add(self.armed_seat)
             route.fallback()
+            released = True
         except Exception:
             self.blocked_reason = "提交参数与计划不一致，或运行状态无法保存；已阻止请求"
             route.abort()
         finally:
             self.routing = False
+            if released:
+                route_finished_ns = perf_counter_ns()
+                timing = {
+                    "seat": self.sent_seat,
+                    "gate_handler_ms": (route_finished_ns - route_started_ns) / 1_000_000,
+                    "_route_finished_ns": route_finished_ns,
+                }
+                if self._click_started_ns is not None:
+                    timing["click_to_request_ms"] = (route_started_ns - self._click_started_ns) / 1_000_000
+                self.attempt_timings.append(timing)
+                self._active_timing = timing
+                self._click_started_ns = None
 
     def response(self, response):
         parsed = urlparse(response.url)
@@ -453,11 +498,30 @@ class RequestGate:
             return
         if parsed.hostname != "office.chaoxing.com" or parsed.path.rstrip("/") != SUBMIT_PATH or not self.pending:
             return
+        self._mark_response()
         try:
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("success") not in (False, "false", 0):
                 return
             message = str(payload.get("msg") or payload.get("message") or "")
+            if any(word in message for word in ("操作频繁", "过于频繁", "请勿频繁", "请求频繁", "稍后再试")):
+                safe_message = "官方提示操作频繁；已停止本次任务，不再换座或追加请求"
+                if self.checkpoint("BLOCKED_BY_RISK", safe_message, False, self.sent_seat):
+                    self.pending = False
+                    self.terminal_code = "RATE_LIMITED"
+                    self.terminal_message = safe_message
+                else:
+                    self.control.cancel.set()
+                return
+            if any(word in message for word in ("非法操作", "异常操作", "风险控制", "风控拦截", "访问被拒绝")):
+                safe_message = "官方拒绝本次操作；已停止本次任务，不再换座或追加请求"
+                if self.checkpoint("BLOCKED_BY_RISK", safe_message, False, self.sent_seat):
+                    self.pending = False
+                    self.terminal_code = "BLOCKED_BY_RISK"
+                    self.terminal_message = safe_message
+                else:
+                    self.control.cancel.set()
+                return
             # A challenge response proves that this request was rejected before
             # booking. Clear the durable unknown-submission flag and let the
             # user finish the official flow in the same window. Only that flow
@@ -548,6 +612,26 @@ class PageAdapter:
 
 
 def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, preview=False, check_only=False, login_only=False) -> BrowserResult:
+    timing_sink: list[dict] = []
+    result = _run_browser_impl(
+        run_id, account_id, values, day, fire_epoch, checkpoint,
+        preview=preview, check_only=check_only, login_only=login_only,
+        timing_sink=timing_sink,
+    )
+    result.attempt_timings = [
+        {
+            key: round(value, 3) if isinstance(value, float) else value
+            for key, value in timing.items()
+            if not key.startswith("_")
+        }
+        for timing in timing_sink
+    ]
+    return result
+
+
+def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *,
+                      preview=False, check_only=False, login_only=False,
+                      timing_sink=None) -> BrowserResult:
     ready = readiness()
     if not ready["ready"]:
         return BrowserResult("FAILED", "BROWSER_NOT_READY", ready["message"])
@@ -562,7 +646,10 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
             _controls.pop(run_id, None)
         return BrowserResult("SKIPPED", "DEADLINE_EXCEEDED", "已超过开抢后的 5 分钟等待上限，未启动预约")
     deadline = time.monotonic() + remaining
-    gate = RequestGate(values, day, preview or check_only or login_only, checkpoint, control, deadline)
+    gate = RequestGate(
+        values, day, preview or check_only or login_only,
+        checkpoint, control, deadline, timing_sink,
+    )
     context = page = None
     fid = ""
     bound_identity = None
@@ -676,6 +763,8 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
         until = time.monotonic() + VERIFY_SECONDS
         detail = ""
         while time.monotonic() < until:
+            if gate.terminal_code:
+                return BrowserResult("BLOCKED_BY_RISK", gate.terminal_code, gate.terminal_message)
             if allow_challenge and gate.challenge_pending:
                 return None
             tick("VERIFYING", "正在核对官方预约记录，不会重复提交", checking=True)
@@ -709,7 +798,7 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
             binding_path = profile / "account-binding.json"
             context = managed.open(pw, profile) if managed else launch_context(pw, profile)
             context.set_default_timeout(3000)
-            context.route("**/*", gate.route)
+            install_request_gate(context, gate)
             context.on("response", gate.response)
             gate.identity_check = lambda: bool(bound_identity and identity() == bound_identity)
             try:
@@ -909,12 +998,14 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
                     button, fid = adapter.prepare(values, day, seat)
                     tick("RUNNING", f"准备预约座位 {seat}")
                     gate.armed_seat = seat
+                    gate.mark_click(seat)
                     button.click(timeout=3000)
                     # Let the page's immediate submit callback reach the gate
                     # before announcing a human challenge. An ordinary network
                     # event must not flash the window or sound an alert.
                     automatic_until = min(deadline, time.monotonic() + 1)
-                    while not gate.pending and not gate.rejected and time.monotonic() < automatic_until:
+                    while (not gate.pending and not gate.rejected and not gate.terminal_code
+                           and time.monotonic() < automatic_until):
                         if adapter.needs_user():
                             break
                         tick('RUNNING', '等待官方提交或验证提示')
@@ -925,7 +1016,7 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
                     # unknown result or rotate to another seat.
                     result = None
                     while True:
-                        while not gate.pending and not gate.rejected:
+                        while not gate.pending and not gate.rejected and not gate.terminal_code:
                             if gate.blocked_reason:
                                 return BrowserResult("NEEDS_VERIFICATION", "BROWSER_INTENT_CHANGED", gate.blocked_reason)
                             message = gate.challenge_message or f"座位 {seat}：请在原窗口完成验证码或官方确认；系统等待提交结果"
@@ -933,17 +1024,24 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
                             page.wait_for_timeout(250)
                         if gate.rejected:
                             break
+                        if gate.terminal_code:
+                            result = BrowserResult("BLOCKED_BY_RISK", gate.terminal_code, gate.terminal_message)
+                            break
                         # Give the direct response a short chance to prove
                         # rejection or announce a human challenge; every other
                         # answer enters read-only reconciliation.
                         until = time.monotonic() + 2
-                        while time.monotonic() < until and not gate.rejected and not gate.challenge_pending:
+                        while (time.monotonic() < until and not gate.rejected
+                               and not gate.challenge_pending and not gate.terminal_code):
                             tick("VERIFYING", "已发送预约，等待官方响应", checking=True)
                             if page.is_closed():
                                 break
                             page.wait_for_timeout(100)
                         if gate.challenge_pending:
                             continue
+                        if gate.terminal_code:
+                            result = BrowserResult("BLOCKED_BY_RISK", gate.terminal_code, gate.terminal_message)
+                            break
                         result = reconcile(allow_challenge=True)
                         if result is None:
                             continue
@@ -983,12 +1081,12 @@ def run_browser(run_id, account_id, values, day, fire_epoch, checkpoint, *, prev
                     pass  # A manually closed browser already has the login checkpoint.
                 try:
                     if managed and not control.cancel.is_set() and not page.is_closed():
-                        context.unroute('**/*', gate.route)
+                        remove_request_gate(context, gate)
                         context.remove_listener('response', gate.response)
                         # Keep a deny gate while idle; delayed official
                         # callbacks may not submit after the task finishes.
                         gate.preview = True
-                        context.route('**/*', gate.route)
+                        install_request_gate(context, gate)
                         page.goto('about:blank', wait_until='domcontentloaded')
                         window_state(page, False)
                         managed.idle_gate = gate

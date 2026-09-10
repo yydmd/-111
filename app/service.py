@@ -337,6 +337,32 @@ def _append_attempt(run: ReservationRun, *, seat: str, source: str, submitted: b
     run.attempt_details_json = json.dumps(details, ensure_ascii=False)
 
 
+def _merge_browser_attempt_timings(run: ReservationRun, timings: list[dict]) -> None:
+    """Attach secret-free browser timing to submitted attempts after the run."""
+    details = run.attempt_details
+    if not details or not timings:
+        return
+    allowed = {"click_to_request_ms", "gate_handler_ms", "request_to_response_ms"}
+    used: set[int] = set()
+    for measurement in timings:
+        seat = str(measurement.get("seat") or "")
+        index = next((
+            i for i, detail in enumerate(details)
+            if i not in used and detail.get("submitted") and detail.get("seat") == seat
+        ), None)
+        if index is None:
+            continue
+        clean = {
+            key: round(float(value), 3)
+            for key, value in measurement.items()
+            if key in allowed and isinstance(value, (int, float)) and value >= 0
+        }
+        if clean:
+            details[index].setdefault("timing", {}).update(clean)
+        used.add(index)
+    run.attempt_details_json = json.dumps(details, ensure_ascii=False)
+
+
 def _persist_discovered_context(plan: ReservationPlan, client: ChaoxingClient) -> None:
     params = getattr(client, "last_discovered_select_params", None)
     source = getattr(client, "last_parameter_source", "")
@@ -1138,6 +1164,12 @@ def _execute_browser(db, plan, account, run, values):
     if not run.attempt_details:
         _append_attempt(run, seat=outcome.seat or "-", source="browser", submitted=bool(run.possibly_submitted),
                         code=outcome.code, message=outcome.message)
+    elif outcome.code in {"RATE_LIMITED", "BLOCKED_BY_RISK"}:
+        details = run.attempt_details
+        details[-1]["code"] = outcome.code
+        details[-1]["message"] = redact(outcome.message)
+        run.attempt_details_json = json.dumps(details, ensure_ascii=False)
+    _merge_browser_attempt_timings(run, outcome.attempt_timings)
 
 
 def execute_plan(

@@ -30,13 +30,13 @@ class AccountSession:
         yield self.pw
 
     def open(self, pw, profile):
-        from .browser_reserve import launch_context
+        from .browser_reserve import launch_context, remove_request_gate
         if self.context:
             try:
                 if self.context.pages and not self.context.pages[0].is_closed():
                     idle_gate = getattr(self, 'idle_gate', None)
                     if idle_gate:
-                        self.context.unroute('**/*', idle_gate.route)
+                        remove_request_gate(self.context, idle_gate)
                         self.idle_gate = None
                     return self.context
             except Exception:

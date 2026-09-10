@@ -142,7 +142,7 @@ def test_cancel_expiry_account_change_and_duplicate_parameters():
 @pytest.mark.parametrize("payload,rejected", [
     ({"success": False, "msg": "座位已被预约"}, True),
     ({"success": True}, False), ({"success": False, "msg": "安全验证失败"}, False),
-    ({"success": False, "msg": "操作频繁"}, False), ([], False),
+    ([], False),
 ])
 def test_only_explicit_rejection_allows_next_seat(payload, rejected):
     gate = make_gate()
@@ -152,6 +152,45 @@ def test_only_explicit_rejection_allows_next_seat(payload, rejected):
     challenged = isinstance(payload, dict) and "安全验证" in str(payload.get("msg", ""))
     assert gate.challenge_pending is challenged
     assert gate.pending is not (rejected or challenged)
+
+
+@pytest.mark.parametrize("message,code", [
+    ("操作频繁，请稍后再试", "RATE_LIMITED"),
+    ("检测到异常操作，风控拦截", "BLOCKED_BY_RISK"),
+])
+def test_risk_control_response_stops_without_trying_another_seat(message, code):
+    checkpoints = []
+    gate = make_gate(checkpoint=lambda *args: checkpoints.append(args) or True)
+    gate.route(Route(intent()))
+    gate.response(SimpleNamespace(
+        url=br.ORIGIN + br.SUBMIT_PATH,
+        json=lambda: {"success": False, "msg": message},
+    ))
+    assert gate.terminal_code == code
+    assert gate.terminal_message
+    assert not gate.pending and not gate.rejected
+    assert checkpoints[-1][0] == "BLOCKED_BY_RISK"
+    assert checkpoints[-1][2] is False
+
+
+def test_gate_records_secret_free_timing_and_meets_local_p95_budget():
+    measurements = []
+    for _ in range(1000):
+        gate = make_gate()
+        gate.mark_click("097")
+        gate.route(Route(intent()))
+        gate.response(SimpleNamespace(
+            url=br.ORIGIN + br.SUBMIT_PATH,
+            json=lambda: {"success": True},
+        ))
+        timing = gate.attempt_timings[0]
+        assert set(timing) == {
+            "seat", "click_to_request_ms", "gate_handler_ms",
+            "request_to_response_ms", "_route_finished_ns",
+        }
+        assert "token" not in str(timing).lower()
+        measurements.append(timing["gate_handler_ms"])
+    assert sorted(measurements)[949] <= 10
 
 
 def test_official_challenge_allows_one_same_seat_continuation_only():
@@ -196,6 +235,20 @@ def test_launch_context_uses_system_browser_without_positional_urls(monkeypatch)
     assert calls[0][1]["args"] == ["--window-size=1200,900"]
     assert calls[0][1]["no_viewport"] is True
     assert calls[0][1]["chromium_sandbox"] is True
+
+
+def test_request_gate_registration_is_narrow_and_reversible():
+    calls = []
+    context = SimpleNamespace(
+        route=lambda pattern, handler: calls.append(("route", pattern, handler)),
+        unroute=lambda pattern, handler: calls.append(("unroute", pattern, handler)),
+    )
+    gate = make_gate()
+    br.install_request_gate(context, gate)
+    br.remove_request_gate(context, gate)
+    assert [item[1] for item in calls[:2]] == list(br.REQUEST_GATE_PATTERNS)
+    assert [item[1] for item in calls[2:]] == list(br.REQUEST_GATE_PATTERNS)
+    assert all(item[1] != "**/*" for item in calls)
 
 
 def test_real_persistent_browser_launch(tmp_path):
@@ -304,8 +357,12 @@ def test_browser_dispatch_snapshot_and_waiting_lifecycle(db_factory, monkeypatch
             assert run.finished_at is None and run.expires_at and run.heartbeat_at
             assert _run_json(run)["execution_mode"] == "browser"
             assert service.active_run_count() == 1
-        checkpoint("VERIFYING", "即将提交", True)
-        return br.BrowserResult("NEEDS_VERIFICATION", "SUBMIT_OUTCOME_UNKNOWN", "核对失败")
+        checkpoint("VERIFYING", "即将提交", True, "097")
+        return br.BrowserResult(
+            "NEEDS_VERIFICATION", "SUBMIT_OUTCOME_UNKNOWN", "核对失败", "097",
+            attempt_timings=[{"seat": "097", "click_to_request_ms": 2.5,
+                              "gate_handler_ms": 1.25, "request_to_response_ms": 8.75}],
+        )
     monkeypatch.setattr(br, "run_browser", browser)
     monkeypatch.setattr(service, "ChaoxingClient", lambda *a, **k: pytest.fail("browser mode must not log in through requests"))
     run_id = service.execute_plan(1)
@@ -313,9 +370,39 @@ def test_browser_dispatch_snapshot_and_waiting_lifecycle(db_factory, monkeypatch
         run = db.get(ReservationRun, run_id)
         assert run.possibly_submitted and run.finished_at
         assert "username" not in run.request_snapshot
+        assert run.attempt_details[0]["timing"] == {
+            "click_to_request_ms": 2.5,
+            "gate_handler_ms": 1.25,
+            "request_to_response_ms": 8.75,
+        }
     next_run = service.execute_plan(1)
     with db_factory() as db:
         assert db.get(ReservationRun, next_run).error_code == "UNRESOLVED_SUBMISSION"
+
+
+def test_browser_rate_limit_is_terminal_and_persisted_with_timing(db_factory, monkeypatch):
+    from app import service
+    calls = []
+    def browser(run_id, account_id, values, day, fire, checkpoint, **kwargs):
+        calls.append(values["seats"])
+        assert checkpoint("VERIFYING", "预约请求即将发送", True, "097")
+        assert checkpoint("BLOCKED_BY_RISK", "官方提示操作频繁；已停止本次任务", False, "097")
+        return br.BrowserResult(
+            "BLOCKED_BY_RISK", "RATE_LIMITED", "官方提示操作频繁；已停止本次任务", "097",
+            attempt_timings=[{"seat": "097", "gate_handler_ms": 0.5}],
+        )
+    monkeypatch.setattr(br, "run_browser", browser)
+    run_id = service.execute_plan(1)
+    with db_factory() as db:
+        run = db.get(ReservationRun, run_id)
+        assert run.status == "BLOCKED_BY_RISK" and run.error_code == "RATE_LIMITED"
+        assert not run.possibly_submitted
+        assert run.attempt_details == [{
+            "seat": "097", "source": "browser", "submitted": True,
+            "code": "RATE_LIMITED", "message": "官方提示操作频繁；已停止本次任务",
+            "timing": {"gate_handler_ms": 0.5},
+        }]
+    assert calls == [["097"]]
 
 
 def test_direct_preview_of_api_plan_never_uses_submit_client(db_factory, monkeypatch):
@@ -402,7 +489,7 @@ def page_fixture():
 def test_real_browser_dynamic_verification_and_single_submission(page_fixture):
     page, context, sent = page_fixture
     gate = make_gate()
-    context.route("**/*", gate.route)
+    br.install_request_gate(context, gate)
     page.goto(br.ORIGIN + "/front/third/apps/seat/select")
     button, _ = br.PageAdapter(page).prepare(VALUES, DAY, "097")
     button.click()
@@ -416,11 +503,40 @@ def test_real_browser_dynamic_verification_and_single_submission(page_fixture):
 def test_real_browser_preview_blocks_even_manual_submission(page_fixture):
     page, context, sent = page_fixture
     gate = make_gate(preview=True)
-    context.route("**/*", gate.route)
+    br.install_request_gate(context, gate)
     page.goto(br.ORIGIN + "/front/third/apps/seat/select")
     button, _ = br.PageAdapter(page).prepare(VALUES, DAY, "097")
     button.click(); page.locator('#human').click(); page.wait_for_timeout(100)
     assert not sent and not gate.pending
+
+
+def test_official_risk_token_request_bypasses_python_gate(page_fixture):
+    page, context, sent = page_fixture
+    risk_requests = []
+    context.route(br.ORIGIN + "/risk/token", lambda route: (
+        risk_requests.append(route.request.url), route.fulfill(json={"token": "fixture"})
+    )[-1])
+    gate = make_gate()
+    routed = []
+    original_route = gate.route
+    def observe(route):
+        routed.append(route.request.url)
+        return original_route(route)
+    gate.route = observe
+    br.install_request_gate(context, gate)
+    risk_html = HTML.replace(
+        "document.querySelector('.time_sure').onclick=()=>document.querySelector('#human').hidden=false;",
+        "document.querySelector('.time_sure').onclick=()=>fetch('/risk/token').then(()=>send());",
+    )
+    context.route(br.ORIGIN + "/front/third/apps/seat/select?**",
+                  lambda route: route.fulfill(body=risk_html, content_type="text/html"))
+    page.goto(br.ORIGIN + "/front/third/apps/seat/select?id=10713")
+    button, _ = br.PageAdapter(page).prepare(VALUES, DAY, "097")
+    gate.mark_click("097")
+    button.click()
+    page.wait_for_timeout(150)
+    assert len(risk_requests) == len(sent) == 1
+    assert routed == [br.ORIGIN + br.SUBMIT_PATH]
 
 
 def test_real_browser_adapter_rejects_wrong_day_or_missing_control(page_fixture):
@@ -451,7 +567,8 @@ def test_official_not_open_notice_is_not_a_login_or_adapter_failure(page_fixture
     ("list_delay", "SUCCESS"), ("merged", "NEEDS_VERIFICATION"),
     ("adjacent_merge", "SUCCESS"), ("seat_fallback", "SUCCESS"),
     ("response_captcha", "SUCCESS"), ("late_response_captcha", "SUCCESS"), ("direct_submit", "SUCCESS"),
-    ("scheduled_direct", "SUCCESS"), ("scheduled_stale_date", "SUCCESS")])
+    ("scheduled_direct", "SUCCESS"), ("scheduled_stale_date", "SUCCESS"),
+    ("rate_response", "BLOCKED_BY_RISK"), ("risk_response", "BLOCKED_BY_RISK")])
 def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, monkeypatch, mode, expected):
     page, context, sent = page_fixture
     import playwright.sync_api
@@ -526,6 +643,12 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
             route.fulfill(json={"success": len(sent) >= 2,
                                 "msg": "成功" if len(sent) >= 2 else "请完成安全验证"})
         context.route(br.ORIGIN + br.SUBMIT_PATH, challenge_then_success)
+    if mode in {'rate_response', 'risk_response'}:
+        def reject_for_risk(route):
+            sent.append(route.request.post_data)
+            message = "操作频繁，请稍后再试" if mode == 'rate_response' else "检测到异常操作，风控拦截"
+            route.fulfill(json={"success": False, "msg": message})
+        context.route(br.ORIGIN + br.SUBMIT_PATH, reject_for_risk)
     direct_html = HTML.replace(
         "document.querySelector('.time_sure').onclick=()=>document.querySelector('#human').hidden=false;",
         "document.querySelector('.time_sure').onclick=()=>send();",
@@ -618,7 +741,7 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
     result = br.run_browser(42, 1, values, DAY, fire_epoch, checkpoint,
                            preview=mode == "preview" or mode.startswith("qr_"), check_only=mode == "recheck")
     assert result.status == expected, result
-    assert len(sent) == (2 if mode in {'seat_fallback', 'response_captcha', 'late_response_captcha'} else 1 if mode in {"success", "unknown", "scheduled_open", "scheduled_direct", "scheduled_stale_date", "direct_submit", "early_captcha", "list_delay", "merged", "adjacent_merge"} else 0)
+    assert len(sent) == (2 if mode in {'seat_fallback', 'response_captcha', 'late_response_captcha'} else 1 if mode in {"success", "unknown", "scheduled_open", "scheduled_direct", "scheduled_stale_date", "direct_submit", "early_captcha", "list_delay", "merged", "adjacent_merge", "rate_response", "risk_response"} else 0)
     if mode == 'list_delay':
         assert list_reads_after_send[0] == 2
     if mode == 'seat_fallback':
@@ -635,6 +758,10 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
         assert result.code == "ALREADY_BOOKED_ON_SERVER"
     if mode == "unknown":
         assert result.code == "SUBMIT_OUTCOME_UNKNOWN"
+    if mode == "rate_response":
+        assert result.code == "RATE_LIMITED"
+    if mode == "risk_response":
+        assert result.code == "BLOCKED_BY_RISK"
     if mode == "recheck":
         assert result.code == "BROWSER_CHECK_ABSENT"
     if mode == "login":
