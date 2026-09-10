@@ -62,7 +62,7 @@ def make_plan(factory, seats=("001", "002"), max_attempts=3):
         account=account, name="p", room_id="100", start_time="08:00", end_time="09:00",
         run_time="19:00", day_offset=2,
         weekdays_json='["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]',
-        max_attempts=max_attempts, enabled=True,
+        max_attempts=max_attempts, enabled=True, execution_mode="api",
     )
     plan.seats = [PlanSeat(seat_num=seat, priority=index) for index, seat in enumerate(seats)]
     db.add(plan)
@@ -498,7 +498,11 @@ def scenario_catchup_after_failed_run() -> None:
     count = scheduler_module._enqueue_recently_missed_jobs(now)
     check("catchup-after-failure", count == 1 and queued == [(plan_id, "scheduled_catchup")], f"queued={queued}")
     db = factory()
-    db.add(ReservationRun(plan_id=plan_id, account_id=1, target_date="2026-09-08", trigger="scheduled", status="SUCCESS", message="done"))
+    db.add(ReservationRun(
+        plan_id=plan_id, account_id=1, target_date="2026-09-08",
+        request_fingerprint="2026-09-08|100|08:00|09:00",
+        trigger="scheduled", status="SUCCESS", message="done",
+    ))
     db.commit()
     db.close()
     check("catchup-blocked-by-success", scheduler_module._enqueue_recently_missed_jobs(now) == 0, "")

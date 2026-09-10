@@ -93,6 +93,7 @@ def browser_benchmark(iterations: int) -> dict:
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(service_workers="block")
         request_counts = {"legacy": 0, "scoped": 0}
+        callback_counts = {"legacy": 0, "scoped": 0}
         active_mode = ["legacy"]
 
         def transport(route):
@@ -110,18 +111,46 @@ def browser_benchmark(iterations: int) -> dict:
             for mode in ("legacy", "scoped"):
                 active_mode[0] = mode
                 measurements = []
+                callbacks = [0]
                 for _ in range(iterations + 5):
                     if _ == 5:
                         request_counts[mode] = 0
+                        callback_counts[mode] = 0
                     gate = br.RequestGate(
                         VALUES, DAY, False, lambda *args: True,
                         br.Control(), time.monotonic() + 30,
                     )
                     gate.armed_seat = "097"
+
+                    class CountingGate:
+                        """Count how many requests reach the Python callback.
+
+                        Narrowing the routing scope is supposed to leave risk and
+                        static traffic native, so the number of Python route
+                        callbacks is the property this benchmark must evidence.
+                        The wrapped handler is one stable object so
+                        ``install_request_gate``/``remove_request_gate`` still
+                        register and drop the exact same handler.
+                        """
+
+                        def __init__(self, wrapped):
+                            self._wrapped = wrapped
+
+                            def handler(route):
+                                callbacks[0] += 1
+                                return wrapped.route(route)
+
+                            self.route = handler
+
+                        def __getattr__(self, name):
+                            return getattr(self._wrapped, name)
+
+                    counting_gate = CountingGate(gate)
+                    callbacks_before = callbacks[0]
                     if mode == "legacy":
-                        context.route("**/*", gate.route)
+                        context.route("**/*", counting_gate.route)
                     else:
-                        br.install_request_gate(context, gate)
+                        br.install_request_gate(context, counting_gate)
                     context.on("response", gate.response)
                     page = context.new_page()
                     try:
@@ -137,15 +166,17 @@ def browser_benchmark(iterations: int) -> dict:
                         if _ >= 5:
                             measurements.append(dict(gate.attempt_timings[-1]))
                     finally:
+                        callback_counts[mode] += callbacks[0] - callbacks_before
                         page.close()
                         context.remove_listener("response", gate.response)
                         if mode == "legacy":
-                            context.unroute("**/*", gate.route)
+                            context.unroute("**/*", counting_gate.route)
                         else:
-                            br.remove_request_gate(context, gate)
+                            br.remove_request_gate(context, counting_gate)
                 results[mode] = {
                     "iterations": iterations,
                     "network_requests": request_counts[mode],
+                    "python_route_callbacks": callback_counts[mode],
                     "click_to_request_ms_p95": percentile(
                         [item["click_to_request_ms"] for item in measurements], 0.95),
                     "gate_handler_ms_p95": percentile(
@@ -158,6 +189,7 @@ def browser_benchmark(iterations: int) -> dict:
 
     results["delta_scoped_minus_legacy"] = {
         "network_requests": results["scoped"]["network_requests"] - results["legacy"]["network_requests"],
+        "python_route_callbacks": results["scoped"]["python_route_callbacks"] - results["legacy"]["python_route_callbacks"],
         "click_to_request_ms_p95": round(
             results["scoped"]["click_to_request_ms_p95"] - results["legacy"]["click_to_request_ms_p95"], 3),
         "gate_handler_ms_p95": round(
@@ -182,6 +214,9 @@ def main() -> int:
     }
     report["accepted"] = bool(
         report["browser"]["delta_scoped_minus_legacy"]["network_requests"] == 0
+        # Narrowing must leave at least the risk/static traffic native: the
+        # scoped gate has to run strictly fewer Python route callbacks.
+        and report["browser"]["delta_scoped_minus_legacy"]["python_route_callbacks"] < 0
         and report["browser"]["delta_scoped_minus_legacy"]["gate_handler_ms_p95"] <= 10
         and report["browser"]["delta_scoped_minus_legacy"]["click_to_request_ms_p95"] <= 10
         and report["unit"]["gate_handler_ms"]["p95"] <= 10

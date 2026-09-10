@@ -37,6 +37,10 @@ DENSE_SAMPLES = 8
 DEFAULT_BUDGET_SECONDS = 4.0
 DENSE_BUDGET_SECONDS = 8.0
 TTL_SECONDS = 10 * 60
+# A failed calibration must not suppress another attempt for the full success
+# TTL.  Retry soon enough to recover before the next scheduled opening while
+# still avoiding a tight loop during a network outage.
+FAILURE_RETRY_SECONDS = 60
 # Refuse absurd offsets: if the "server" claims more than this, keep local time.
 SANITY_LIMIT_SECONDS = 300.0
 # HTTP ``Date`` headers truncate the server clock to whole seconds, so every
@@ -134,7 +138,8 @@ def server_offset() -> float:
     """Current best offset (server time - local time), refreshed when stale."""
     with _lock:
         age = time.time() - _measured_at
-        stale = age > TTL_SECONDS or (_measured_at == 0.0)
+        ttl = FAILURE_RETRY_SECONDS if _last_error else TTL_SECONDS
+        stale = age > ttl or (_measured_at == 0.0)
     if stale:
         refresh()
     with _lock:

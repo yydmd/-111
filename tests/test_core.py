@@ -688,7 +688,8 @@ def test_stale_runs_are_marked_for_verification_not_replayed(tmp_path, monkeypat
 
     factory = _test_session_factory(tmp_path)
     db = factory()
-    db.add(ReservationRun(trigger="scheduled", status="RUNNING", message="started", started_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=90)))
+    db.add(ReservationRun(trigger="scheduled", status="RUNNING", message="started", possibly_submitted=True,
+                          started_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=90)))
     db.commit()
     db.close()
     monkeypatch.setattr(service, "SessionLocal", factory)
@@ -697,6 +698,45 @@ def test_stale_runs_are_marked_for_verification_not_replayed(tmp_path, monkeypat
     run = db.scalar(select(ReservationRun))
     assert (run.status, run.error_code) == ("NEEDS_VERIFICATION", "INTERRUPTED_NEEDS_VERIFICATION")
     db.close()
+
+
+def test_stale_run_interrupted_before_submit_is_safe_for_scheduler_retry(tmp_path, monkeypatch):
+    import app.service as service
+
+    factory = _test_session_factory(tmp_path)
+    db = factory()
+    db.add(ReservationRun(trigger="scheduled", status="RUNNING", message="started", possibly_submitted=False,
+                          started_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=90)))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(service, "SessionLocal", factory)
+    assert service.recover_interrupted_runs() == 1
+    db = factory()
+    run = db.scalar(select(ReservationRun))
+    assert (run.status, run.error_code) == ("FAILED", "INTERRUPTED_SAFE_TO_RETRY")
+    assert not run.possibly_submitted and "安全补跑" in run.message
+    db.close()
+
+
+def test_failed_clock_calibration_retries_before_success_ttl(monkeypatch):
+    import app.clock as clock
+
+    now = [1000.0]
+    refreshes = []
+    monkeypatch.setattr(clock.time, "time", lambda: now[0])
+    monkeypatch.setattr(clock, "_measured_at", now[0])
+    monkeypatch.setattr(clock, "_last_error", "未能取得服务器时间")
+    monkeypatch.setattr(clock, "_offset", 0.0)
+
+    def fake_refresh():
+        refreshes.append(now[0])
+        return 0.0
+
+    monkeypatch.setattr(clock, "refresh", fake_refresh)
+    now[0] += clock.FAILURE_RETRY_SECONDS - 1
+    assert clock.server_offset() == 0.0 and not refreshes
+    now[0] += 2
+    assert clock.server_offset() == 0.0 and refreshes == [now[0]]
 
 
 def test_v5_database_migrates_context_and_attempt_audit_columns(tmp_path, monkeypatch):

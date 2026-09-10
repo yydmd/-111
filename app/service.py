@@ -978,10 +978,12 @@ def _parallel_opening_shot(
 
 
 def recover_interrupted_runs(*, startup: bool = False) -> int:
-    """Mark stale durable work for review instead of blindly re-submitting it.
+    """Close stale durable work, preserving only genuine submission uncertainty.
 
     An external reservation can succeed just before a local process crashes, so
-    replaying a pending row would risk duplicate reservations.
+    a run whose request may have left the process remains verification-only.  A
+    run interrupted before any submission is safe for the scheduler's ordinary
+    missed-run recovery instead of being needlessly blocked.
     """
     db = SessionLocal()
     try:
@@ -997,9 +999,14 @@ def recover_interrupted_runs(*, startup: bool = False) -> int:
                  (not (run.status == 'PENDING' and owns_account(run.account_id)) and
                   not live_browser_run(run.heartbeat_at, run.expires_at, now) and run.started_at < cutoff)]
         for run in stale:
-            run.status = "NEEDS_VERIFICATION"
-            run.error_code = "INTERRUPTED_NEEDS_VERIFICATION"
-            run.message = "服务在该任务完成前中断；为避免重复预约，请先在超星端确认"
+            if run.possibly_submitted:
+                run.status = "NEEDS_VERIFICATION"
+                run.error_code = "INTERRUPTED_NEEDS_VERIFICATION"
+                run.message = "服务在该任务完成前中断；为避免重复预约，请先在超星端确认"
+            else:
+                run.status = "FAILED"
+                run.error_code = "INTERRUPTED_SAFE_TO_RETRY"
+                run.message = "服务在提交前中断；未发现未核实提交，可由调度器安全补跑"
             run.finished_at = now
         db.commit()
         return len(stale)
@@ -1074,9 +1081,10 @@ def _execute_browser(db, plan, account, run, values):
     db.commit()
     last_commit = 0.0
     notified = set()
+    terminal_checkpoint = None
 
-    def checkpoint(status, message, submitted, seat=None):
-        nonlocal last_commit
+    def checkpoint(status, message, submitted, seat=None, code=None):
+        nonlocal last_commit, terminal_checkpoint
         current = time.monotonic()
         changed = run.status != status or run.message != message or submitted is not None
         if changed or current - last_commit >= 2:
@@ -1090,6 +1098,8 @@ def _execute_browser(db, plan, account, run, values):
                 db.commit()
                 return False
             run.status, run.message = status, redact(message)
+            if status == "BLOCKED_BY_RISK":
+                terminal_checkpoint = (code or "BLOCKED_BY_RISK", redact(message), seat)
             run.heartbeat_at = datetime.now(dt.UTC).replace(tzinfo=None)
             if submitted is not None:
                 run.possibly_submitted = submitted
@@ -1106,7 +1116,9 @@ def _execute_browser(db, plan, account, run, values):
                                 code="SUBMIT_OUTCOME_UNKNOWN", message="请求已放行，等待官方结果")
             elif submitted is False and run.attempt_details:
                 details = run.attempt_details
-                details[-1]["code"] = "SEAT_UNAVAILABLE" if status == "RUNNING" else None
+                details[-1]["code"] = code if code is not None else (
+                    "SEAT_UNAVAILABLE" if status == "RUNNING" else None
+                )
                 details[-1]["message"] = redact(message)
                 run.attempt_details_json = json.dumps(details, ensure_ascii=False)
             db.commit()
@@ -1125,12 +1137,21 @@ def _execute_browser(db, plan, account, run, values):
     browser_values = {**values, "username": account.username}
     outcome = run_browser(run.id, account.id, browser_values, run.target_date, fire_epoch, checkpoint,
                           preview=preview, check_only=check_only)
+    # Preserve an already-persisted terminal verdict even if the browser closes
+    # or raises while the response callback is unwinding.
+    if terminal_checkpoint and outcome.code in {"BROWSER_WINDOW_CLOSED", "BROWSER_CANCELLED"}:
+        code, message, seat = terminal_checkpoint
+        outcome = BrowserResult(
+            "BLOCKED_BY_RISK", code, message, seat,
+            attempt_timings=outcome.attempt_timings,
+        )
     # Before any request is released, an accidentally closed/crashed browser
     # is safe to rebuild. Retry once with the same immutable run snapshot and
     # account profile; a second closure remains terminal, and an explicit
     # cancel or any possibly-submitted request is never replayed.
     if (not preview and not check_only
             and outcome.code == "BROWSER_WINDOW_CLOSED"
+            and terminal_checkpoint is None
             and not run.possibly_submitted
             and app_clock.server_now() < fire_epoch + BROWSER_RUN_SECONDS):
         if checkpoint("RUNNING", "预约窗口意外关闭，正在自动恢复一次", False):

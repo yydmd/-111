@@ -1,5 +1,136 @@
 # 问题记录
 
+## 2026-09-11 实战失败复盘与运行分支切换：5 项缺陷修复
+
+### 修复清单
+
+1. **浏览器关闭被误报为页面不兼容**（`app/browser_reserve.py`）：Playwright 的 `TargetClosedError` 以及浏览器断连后连 `page.is_closed()` 都会抛错的情况，统一归类为 `BROWSER_WINDOW_CLOSED`。未提交时可进入既有的一次窗口恢复逻辑，不再落成 `BROWSER_PAGE_UNSUPPORTED`。
+2. **无提交的中断被错误要求人工核实，并阻止安全补跑**（`app/service.py`）：恢复时按 `possibly_submitted` 分流；可能已提交仍为 `INTERRUPTED_NEEDS_VERIFICATION`，明确未提交改为 `FAILED / INTERRUPTED_SAFE_TO_RETRY`，允许调度器执行普通补跑。
+3. **座位明确占用后的状态落库失败仍可能继续换座**（`app/browser_reserve.py`）：`SEAT_UNAVAILABLE` 分支现在检查 `checkpoint()` 返回值；账号或计划已停用、状态无法提交时立即设置取消信号，并保留未知提交保护。
+4. **时钟校准失败后坏状态锁定 10 分钟**（`app/clock.py`）：成功测量仍缓存 10 分钟，失败或异常偏差改为 60 秒后重试，避免一次网络故障影响下一次开抢校准。
+5. **独立升级检查误启真实浏览器并长期挂起**（`tests/upgrade_check.py`）：测试计划显式使用 `execution_mode="api"`；同时补齐成功去重夹具的请求指纹，使独立验收与生产语义一致。
+
+### 验证与运行态
+
+- `tests/upgrade_check.py`：43/43 通过（约 4 秒，不再挂起）。
+- `tests/test_core.py` + `tests/test_browser.py`：209/209 通过；`compileall` 通过；`git diff --check` 无错误。
+- 当前运行分支为 `codex/risk-control-compat`，健康检查显示数据库、调度器正常且无活动任务；原 `local-web-refactor` 工作区保留但没有运行进程。
+- 计划 11“测试”（账号 1、18:58）与计划 4“缪迪正式抢座”（同账号、19:00）会因提前 10 分钟预热及单账号锁发生确定性冲突；已停用“测试”但保留记录，正式计划继续启用。
+
+---
+
+## 2026-09-10 检测面修复（N1 第一步）：移除关键路径上的"非页面"列表请求
+
+- **背景**：用户明确第二根轴是**防脚本检测**（不只是数据一致性）。复查发现程序周边只读请求不经过浏览器页面，头签名与页面 XHR 明显不同；且提交之前那一次列表核对发生在**关键路径**上。
+
+### 实测证据（已固化为可复现脚本 `scripts/probe_request_headers.py`）
+
+纯本地回环（不触官方站、不读库/资料、无窗口）对比：
+
+| 请求头 | 页面内 XHR | `context.request`（`lookup()` 用的） |
+|---|---|---|
+| `Referer` | 有 | **无** |
+| `Sec-Fetch-Dest / Mode / Site` | 有 | **无** |
+| `sec-ch-ua / -mobile / -platform` | 有 | **无** |
+| `accept-encoding` | `gzip, deflate, br, zstd` | `gzip,deflate,br` |
+
+另：`app/clock.py:74` 的时钟探测用 Python `requests`，UA 写死裸 `Mozilla/5.0`（典型脚本签名），目标是官方站（`clock.py:28-29`）。
+
+### 关键事实（决定改法）
+
+核对官方选座页脚本留存（生产工作区 `data/browser-inspection/select.js`，81KB）：它**只调用** `data/apps/seat/getdrawseat` 与 `data/apps/seat/seatgrid/roomid`，**从不调用** `/data/apps/seat/index`，全文无 `curReserves`。
+→ 所以"提交前核对"所用的列表接口，**官方页面自己根本不发**。原计划的"复用页面已有数据（零请求）"不可行；该请求即使补上浏览器头，仍是页面流程外的动作。
+
+### 改动（`app/browser_reserve.py`）
+
+**移除开火之后的那次核对**（原 `tick("RUNNING","提交前核对已有预约")` + `lookup()` + 两个早退分支），保留**开火之前**的那次。理由与收益：
+
+1. 它要查的是"**本账号**是否已有该时段预约"，而开抢瞬间本账号列表必然为空 —— 有价值的是开火前那次，不是开火后那次；
+2. 它位于关键路径：每次候选在"平台开抢时刻"与"点击提交"之间多出一次往返；
+3. 每个候选少一次"页面不会发的请求"（每候选 2 次 → 1 次，6 候选即 12 次 → 6 次）；
+4. `submission_baseline` 自动改由开火前那次结果提供（语义上更正确：真正的"提交前基线"）。
+
+**能力保留**：开火前核对仍在；结果不明时的对账（`reconcile` 内的 `lookup`）仍在；本地去重与 `possibly_submitted` 阻断仍在；页面禁用态判断（`prepare()` 已在用 `cls==='noSelect'`）仍在。
+**已知代价**：开火瞬间到点击之间不再二次核对，理论上存在"本账号在同一瞬间被别的设备约到"的极小窗口；由平台自身拒绝（座位已被预约 → 换座）与提交后对账兜底。
+
+### 验证
+
+- `tests/test_browser.py` 106/106 通过（新增断言：`success` 场景下**提交前的列表读取恰好 1 次**，锁死"开火后不再有列表请求"）；`tests/test_core.py` 99/99 通过。
+- 全链路 29 个模拟场景（含 merged / adjacent_merge / existing_disabled / seat_fallback / list_delay / stale_* / rate_* / risk）全部通过，说明相邻合并、冲突、既有预约跳过等语义未受影响。
+
+### 涉及文件
+
+- `app/browser_reserve.py`、`tests/test_browser.py`、`scripts/probe_request_headers.py`（新增）、`data/qa/upgrade-plan.md`
+
+---
+
+## 2026-09-10 升级执行 P0 + P2-1：现役链路补 303「刷新后重提」通道
+
+- **背景**：`data/qa/speed-safety-assessment.md` 把"现役浏览器链路对平台 303『页面停留过久，请刷新后再提交』的处理"列为最高优先待确认项。本轮先做纯离线判定（不触网、不跑真实预约），确认缺口成立并修复。方案见 `data/qa/upgrade-plan.md`。
+
+### P0 判定（离线夹具，三种形态）
+
+1. `stale_plain`（不含"安全验证"的刷新文案）修复前：无任何分支匹配 → `pending` 保持 True → 20s 只读对账 → `SUBMIT_OUTCOME_UNKNOWN`，**完全不重提**。
+2. `stale_security`（平台真实文案，同时含"安全验证"与"页面停留过久"）修复前：被**误判为人工挑战** → 开一次同座位续提但要求人工在原窗口动作，人不动作则一直等到任务截止。
+3. `stale_redirect`（原始 303 + Location、无可解析正文）修复前：结果未知。
+
+结论：**"官方页面 JS 会替程序兜住 303"的假设不成立**——闸门会 abort 任何同座位的二次提交（`app/browser_reserve.py:449-452`），而唯一解锁通道原本只在验证码分支开启（`:550-558`）。同一条平台文案，API 链路按 `TOKEN_STALE` 自动刷新重提（法理见 `app/service.py:39-42`），浏览器链路却退化为"等人工 / 结果未知"。
+
+### 修复（P2-1）
+
+- 闸门新增 `REFRESH_REJECTION_WORDS` 与 `refresh_pending` / `refresh_serial`，分类**排在人工挑战分支之前**（因真实文案同时含"安全验证"）。
+- 复用既有"显式解锁"语义：`continuation = challenge_pending or refresh_pending`，解锁在放行时**被消费**；**`attempted` 未做任何放宽**，同座位第三枪仍被拒。
+- 座位循环由 `for` 改为有界 `deque`：收到刷新拒绝时把**同一座位** `appendleft` 重新入队、立即重走完整每座位流程（重新加载页面取得新 token + 提交前重复核对 + 再点击），上限 `REFRESH_RETRY_LIMIT = 1` 次/座位；超限如实报 `TOKEN_STALE`，不再误报"座位不可预约"或"结果未知"。
+
+### 验证
+
+- `tests/test_browser.py` 106/106 通过（新增 3 个 `stale_*` 场景 + 闸门级不变量单测 `test_refresh_rejection_arms_one_same_seat_retry_without_loosening_attempted`）；`tests/test_core.py` 99/99 通过。
+- 为规避受限环境下的 Chromium 驱动抖动，浏览器用例分块运行（36+35+18+17）后逐块全绿。
+
+### 遗留
+
+- **P2-1b**：原始 `303 + Location`（无可解析正文）仍无法分类。需先采集一次真实 303 的响应形态（状态码 / 正文 / 重定向目标），避免把"会话失效需重登"误判成"可重提"。
+- P1（速度度量）、P2-2/P2-3（开火补偿、jitter）、P2-4/P2-5、P3（凭据卫生、死代码、文档计数）均未开始。
+
+### 涉及文件
+
+- `app/browser_reserve.py`、`tests/test_browser.py`、`data/qa/upgrade-plan.md`、`data/qa/speed-safety-assessment.md`
+
+---
+
+## 2026-09-10 复审 216a665「优化浏览器风控兼容与请求闸门」：6 项缺陷核实并修复（1 高 + 2 中）
+
+- **背景**：对提交 216a665 做只读复审，报告 4 处真实缺陷 + 2 处证据问题。本轮逐条核实均属实并完成修复；上一轮修复进行到一半中断（工作区留有未完成的改动与一个挂死的用例）。
+
+### 修复清单
+
+1. **【高】限流被判成风控终局，同一错误码两条链路两种语义**（`app/browser_reserve.py`）：收到“操作频繁/过于频繁/请勿频繁/请求频繁/稍后再试”时原以 `BLOCKED_BY_RISK` + `terminal_code=RATE_LIMITED` 停手整轮，与 `service.py:_RETRYABLE_CODES`、`chaoxing_client.py` 的“限流不是风控判决”口径及前端 `RATE_LIMITED` 文案相反。改为 `checkpoint("RUNNING", "官方提示操作频繁；已退避并继续检查下一候选", False, seat, "RATE_LIMITED")`，置 `rejected` 并记录 `rejection_code/rejection_message`，退避 `RATE_LIMIT_BACKOFF_MS=500` 后继续下一候选；只有“非法操作/异常操作/风险控制/风控拦截/访问被拒绝”仍是终局。运行状态回落为 `FAILED`，界面不再同时出现“风控拦截 + 自动退避重试”。
+2. **【中高】风控终局能被“窗口意外关闭”重试推翻**（`app/service.py`）：`checkpoint` 留存已落库的终局判决 `terminal_checkpoint`；`_execute_browser` 在 outcome 为 `BROWSER_WINDOW_CLOSED/BROWSER_CANCELLED` 时用终局判决覆盖结果，窗口关闭重试条件增加 `terminal_checkpoint is None`，被风控/拒绝后不再二次提交。
+3. **【中】终局判决被 InterruptedError 吞掉**（`app/browser_reserve.py`）：`except InterruptedError` 与 `except Exception` 的兜底条件由 `gate.pending` 改为 `gate.pending or gate.terminal_code`，终局（`pending=False`）不再退化成 `BROWSER_CANCELLED` 并丢失 `terminal_code`。
+4. **【低】计时埋点三处不准**（`app/browser_reserve.py`）：`mark_click(seat)` 记录 `(seat, ns)` 并在对应提交回调内消费一次（被拦下的点击不再污染后续换座/验证续提的 `click_to_request_ms`）；`_mark_response(response)` 改为按请求对象配对，仅在唯一未配对请求时才回退，避免同一座位两次提交时把 `request_to_response_ms` 记错。
+5. **【低】收窄后的闸门覆盖缺口**（`app/browser_reserve.py`）：pattern 由 `ORIGIN + "/data/apps/seat/**"` 改为正则 `^https://office\.chaoxing\.com/(?:.*/)?data/apps/seat(?:/.*)?(?:\?.*)?$`，恢复对带前缀的未知 seat 变更路径（如 `/front/third/apps/data/apps/seat/cancel`）及尾斜杠/query 写法的拦截；`install/remove_request_gate` 仍用同一 pattern 对象注册与注销。
+6. **【低】验收证据与结论不符**（`data/qa/anti-detection-research.md`、`scripts/benchmark_browser_gate.py`）：修正文档中与代码不符的 pattern 描述，并如实写明 `context.on("response", ...)` 仍接收全部响应、收窄 routing 并不减少这部分固定开销；基准新增“进入 Python 路由回调的请求数”指标（150 → 50）——这才是收窄的可测量收益；验收口径明确为 10ms 红线而非“不劣化”，并标注浏览器级毫秒数的抖动区间，不再暗示“收窄路由更快”。
+
+### 验证
+
+- `tests/test_browser.py` 101/101 通过（另 1 项实机持久化浏览器启动检查需交互桌面，单独运行）；`tests/test_core.py` 99/99 通过。
+- 新增全链路场景 `rate_then_success`：097 被限流 → 退避 → 098 提交成功；并修复上一轮遗留的该用例缺陷（第二候选未触发人工提交回调，主循环空等到 deadline，表现为挂死）。
+- 新增/改造用例：`test_rate_limit_is_retryable_but_explicit_risk_is_terminal`、`test_terminal_risk_checkpoint_survives_window_close_without_replay`、`test_blocked_submit_consumes_click_timing`、`test_response_timing_is_attached_to_its_request_not_latest_attempt`、`test_nested_unknown_seat_mutation_is_still_blocked`。
+- 基准重跑：网络请求 0 增量、Python 回调 -100、三项计时差值均 ≤10ms 红线，`accepted: true`。
+- `tests/upgrade_check.py` 单次运行 15 分钟未结束（疑似某场景在等计划开抢时刻），未作为本轮证据。
+
+### 涉及文件
+
+- `app/browser_reserve.py`、`app/service.py`、`tests/test_browser.py`、`scripts/benchmark_browser_gate.py`
+- `data/qa/anti-detection-research.md`、`data/qa/anti-detection-benchmark.json`
+
+### 备注
+
+- 遗留设计取舍：限流后仅换座到下一候选，不在同一窗口内重试同一座位（`RequestGate.attempted` 会阻止同座位二次提交）。单候选计划被限流时仍会以 `RATE_LIMITED` 结束本轮，需靠下一轮定时任务兜底；若要同座位重试，需先论证“平台已明确拒绝、可安全重提”的不变量后再改。
+- 测试注意：`tests/test_browser.py::test_real_persistent_browser_launch` 会用 `headless=False` 拉起系统 Edge（仅本地 `set_content`，不访问官方站点）。受限环境下并发启动 Chromium 可能报 `PlaywrightContextManager`/驱动连接错误，属环境抖动，隔离运行均通过。
+
+---
+
 ## 2026-09-03 定版前收尾：校准回落 + 独立复审修复 5 项（含 1 高 2 中）
 
 - **背景**：用户要求定版前"补校准回落小修复 + 验证无其他 bug"。回落修复后，派独立审查代理对三轮竞速改动（2032232 → 工作区）做全新视角复审，确认 6 项不变量中 5 项成立、并发现 3 个真实缺陷 + 2 个低危，全部修复。
@@ -121,7 +252,7 @@
 - racer 兜底会跨会话复用 poller 页面 token，多 racer 同时提交字节级相同 token。
 - `submit_enc` 多输入时"最后者胜"（legacy 取第一个）；token 正则无词边界可能匹配 `captchaToken` 等。
 - 登录凭据走 URL 查询串（沿袭 upstream）；登录失败不区分验证码/锁定。
-- `clock` 拒绝异常偏差后仍刷新 `_measured_at`（坏数据锁定 10 分钟）；`security.redact` 的裸 `enc` 子串会过度改写。
+- `security.redact` 的裸 `enc` 子串会过度改写。
 - 预算读活 plan 而非快照（30s 提前唤醒窗口内改计划会影响在跑任务）；racer 线程只捕获 ReservationError，其余异常静默无 outcome。
 - 服务停机超过 90s 后恢复的当天计划静默丢失（补跑窗口外）；`shutdown(wait=False)` 可能让停机瞬间入队的 run 滞留 PENDING。
 - `_solve_slider` 是死代码（UI 开关无效承诺）；legacy `utils/reserve.py` 请求无超时，接线前必须先补。

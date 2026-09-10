@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter_ns
@@ -35,8 +36,20 @@ SUBMIT_PATH = "/data/apps/seat/submit"
 READ_SEAT_PATHS = {"index", "room/info", "room/info/switch", "getusedtimes", "getusedseatnums", "address", "captcha"}
 REQUEST_GATE_PATTERNS = (
     "https://passport2.chaoxing.com/fanyalogin**",
-    ORIGIN + "/data/apps/seat/**",
+    re.compile(r"^https://office\.chaoxing\.com/(?:.*/)?data/apps/seat(?:/.*)?(?:\?.*)?$"),
 )
+RATE_LIMIT_BACKOFF_MS = 500
+# The platform's own 303 remedy: "you sat on the page too long, refresh and
+# resubmit". Unlike a risk verdict this is an explicit refusal that asks for a
+# resubmit, so re-sending the same seat after a fresh page load cannot double
+# book — the same reasoning the HTTP path already applies to TOKEN_STALE
+# (app/service.py:39-42). Checked BEFORE the human-challenge words because the
+# platform's wording also contains 安全验证.
+REFRESH_REJECTION_WORDS = ("刷新后再提交", "刷新页面后重试", "请刷新后重试", "请刷新页面",
+                           "页面停留过久", "安全验证已超时")
+# One automatic refresh-and-resubmit per seat; a persistently stale page then
+# hands over to the remaining candidates instead of hammering.
+REFRESH_RETRY_LIMIT = 1
 
 
 @dataclass
@@ -54,6 +67,21 @@ class Control:
     focus: threading.Event = field(default_factory=threading.Event)
     awaiting_identity: str | None = None
     confirmed_identity: str | None = None
+
+
+def _browser_target_closed(page, exc: BaseException | None = None) -> bool:
+    """Recognise a dead Playwright target without letting the probe mask it."""
+    if exc is not None and exc.__class__.__name__ == "TargetClosedError":
+        return True
+    if page is None:
+        return False
+    try:
+        return bool(page.is_closed())
+    except Exception:
+        # Once the browser/context connection is gone, even is_closed() may
+        # raise.  That is still a closed-target condition, not a page-layout
+        # incompatibility.
+        return True
 
 
 _controls: dict[int, Control] = {}
@@ -376,8 +404,17 @@ class RequestGate:
         self.sent_seat = None
         self.attempted = set()
         self.rejected = False
+        self.rejection_code = None
+        self.rejection_message = ""
         self.challenge_pending = False
         self.challenge_message = ""
+        self.refresh_pending = False
+        self.refresh_message = ""
+        # Bumped every time the platform asks for a refresh-and-resubmit. The
+        # runner compares it against the value it saw before clicking, so an
+        # unlock armed for the current attempt is not mistaken for a fresh
+        # rejection arriving while that attempt is still on the wire.
+        self.refresh_serial = 0
         self.blocked_reason = ""
         self.terminal_code = None
         self.terminal_message = ""
@@ -385,14 +422,26 @@ class RequestGate:
         self.login_matches = False
         self.identity_check = lambda: True
         self.attempt_timings = timing_sink if timing_sink is not None else []
-        self._click_started_ns = None
-        self._active_timing = None
+        self._click_started = None
 
     def mark_click(self, seat: str) -> None:
-        self._click_started_ns = perf_counter_ns()
+        self._click_started = (seat, perf_counter_ns())
 
-    def _mark_response(self) -> None:
-        timing = self._active_timing
+    def _mark_response(self, response) -> None:
+        request = getattr(response, "request", None)
+        timing = next((
+            item for item in self.attempt_timings
+            if request is not None and item.get("_request") is request
+        ), None)
+        if timing is None:
+            # Lightweight unit transports do not expose response.request. A
+            # single outstanding request is still unambiguous; with two or
+            # more, omit the metric rather than attach it to the wrong try.
+            outstanding = [
+                item for item in self.attempt_timings
+                if "request_to_response_ms" not in item
+            ]
+            timing = outstanding[0] if len(outstanding) == 1 else None
         if timing is not None and "request_to_response_ms" not in timing:
             timing["request_to_response_ms"] = (perf_counter_ns() - timing["_route_finished_ns"]) / 1_000_000
 
@@ -421,11 +470,20 @@ class RequestGate:
                 route.fallback()
             return
         route_started_ns = perf_counter_ns()
+        click_started_ns = None
+        if self._click_started is not None and self._click_started[0] == self.armed_seat:
+            click_started_ns = self._click_started[1]
+            # A submit callback consumes the click even when the gate blocks
+            # it. It must never inflate a later candidate/challenge timing.
+            self._click_started = None
         released = False
         if self.preview or self.control.cancel.is_set() or time.monotonic() >= self.deadline:
             route.abort()
             return
-        continuation = self.challenge_pending and self.armed_seat == self.sent_seat
+        # An explicit platform unlock — a completed human challenge, or the
+        # platform's own "refresh and resubmit" refusal — is the only way the
+        # same seat may be sent twice. ``attempted`` itself is never relaxed.
+        continuation = (self.challenge_pending or self.refresh_pending) and self.armed_seat == self.sent_seat
         if (not self.armed_seat or self.pending or self.routing or
                 (self.armed_seat in self.attempted and not continuation)):
             route.abort()
@@ -461,6 +519,8 @@ class RequestGate:
             if continuation:
                 self.challenge_pending = False
                 self.challenge_message = ""
+                self.refresh_pending = False
+                self.refresh_message = ""
             # The callback checks account enablement again and commits before IO.
             if not self.checkpoint("VERIFYING", "预约请求即将发送，正在核对结果", True, self.armed_seat):
                 route.abort()
@@ -481,12 +541,11 @@ class RequestGate:
                     "seat": self.sent_seat,
                     "gate_handler_ms": (route_finished_ns - route_started_ns) / 1_000_000,
                     "_route_finished_ns": route_finished_ns,
+                    "_request": request,
                 }
-                if self._click_started_ns is not None:
-                    timing["click_to_request_ms"] = (route_started_ns - self._click_started_ns) / 1_000_000
+                if click_started_ns is not None:
+                    timing["click_to_request_ms"] = (route_started_ns - click_started_ns) / 1_000_000
                 self.attempt_timings.append(timing)
-                self._active_timing = timing
-                self._click_started_ns = None
 
     def response(self, response):
         parsed = urlparse(response.url)
@@ -498,27 +557,44 @@ class RequestGate:
             return
         if parsed.hostname != "office.chaoxing.com" or parsed.path.rstrip("/") != SUBMIT_PATH or not self.pending:
             return
-        self._mark_response()
+        self._mark_response(response)
         try:
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("success") not in (False, "false", 0):
                 return
             message = str(payload.get("msg") or payload.get("message") or "")
             if any(word in message for word in ("操作频繁", "过于频繁", "请勿频繁", "请求频繁", "稍后再试")):
-                safe_message = "官方提示操作频繁；已停止本次任务，不再换座或追加请求"
-                if self.checkpoint("BLOCKED_BY_RISK", safe_message, False, self.sent_seat):
+                safe_message = "官方提示操作频繁；已退避并继续检查下一候选"
+                if self.checkpoint("RUNNING", safe_message, False, self.sent_seat, "RATE_LIMITED"):
                     self.pending = False
-                    self.terminal_code = "RATE_LIMITED"
-                    self.terminal_message = safe_message
+                    self.rejected = True
+                    self.rejection_code = "RATE_LIMITED"
+                    self.rejection_message = safe_message
                 else:
                     self.control.cancel.set()
                 return
             if any(word in message for word in ("非法操作", "异常操作", "风险控制", "风控拦截", "访问被拒绝")):
                 safe_message = "官方拒绝本次操作；已停止本次任务，不再换座或追加请求"
-                if self.checkpoint("BLOCKED_BY_RISK", safe_message, False, self.sent_seat):
+                if self.checkpoint("BLOCKED_BY_RISK", safe_message, False, self.sent_seat, "BLOCKED_BY_RISK"):
                     self.pending = False
                     self.terminal_code = "BLOCKED_BY_RISK"
                     self.terminal_message = safe_message
+                else:
+                    self.control.cancel.set()
+                return
+            # The platform's explicit 303 remedy: it refused the request and
+            # asks for a page refresh plus a resubmit. Mirror the HTTP path's
+            # TOKEN_STALE handling — refresh the page for a fresh token and
+            # re-send the SAME seat once — instead of degrading to an unknown
+            # outcome or a human challenge. Must be checked before the
+            # human-challenge words, which this wording also contains.
+            if any(word in message for word in REFRESH_REJECTION_WORDS):
+                safe_message = "官方要求刷新页面后重新提交；正在重新加载页面并再提交一次"
+                if self.checkpoint("RUNNING", safe_message, False, self.sent_seat, "TOKEN_STALE"):
+                    self.pending = False
+                    self.refresh_pending = True
+                    self.refresh_message = safe_message
+                    self.refresh_serial += 1
                 else:
                     self.control.cancel.set()
                 return
@@ -537,9 +613,14 @@ class RequestGate:
                 return
             # Only an explicit seat rejection permits moving to another seat.
             if any(word in message for word in ("已被预约", "已被别人预约", "座位不可预约", "座位已被", "座位被占用")):
-                self.checkpoint("RUNNING", "官方明确返回座位不可预约，准备检查下一候选", False)
-                self.pending = False
-                self.rejected = True
+                safe_message = "官方明确返回座位不可预约，准备检查下一候选"
+                if self.checkpoint("RUNNING", safe_message, False, self.sent_seat, "SEAT_UNAVAILABLE"):
+                    self.pending = False
+                    self.rejected = True
+                    self.rejection_code = "SEAT_UNAVAILABLE"
+                    self.rejection_message = safe_message
+                else:
+                    self.control.cancel.set()
         except Exception:
             pass  # lost/invalid response must leave pending=True
 
@@ -660,6 +741,8 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
     checking_login = False
     last_lookup_items = None
     submission_baseline = None
+    last_rejection_code = None
+    last_rejection_message = ""
 
     def identity():
         # Persist only a hash binding, never an authentication token. This also
@@ -871,9 +954,16 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                             needs_login = True
                         else:
                             checkpoint('RUNNING', '官方已确认登录有效', None)
-                for seat in values["seats"][:min(6, values.get("max_attempts", 6))]:
+                pending_seats = deque(values["seats"][:min(6, values.get("max_attempts", 6))])
+                refresh_retries: dict[str, int] = {}
+                while pending_seats:
+                    seat = pending_seats.popleft()
                     gate.armed_seat = None
                     gate.rejected = False
+                    gate.rejection_code = None
+                    gate.rejection_message = ""
+                    # Unlocks already armed for this pass are not "new" rejections.
+                    refresh_seen = gate.refresh_serial
                     url = select_url(values, day, seat)
                     if check_only:
                         url = ORIGIN + "/front/third/apps/seat/code?" + urlencode({"id": values["room_id"], "seatNum": seat})
@@ -987,12 +1077,18 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                     while clock.server_now() < fire_epoch:
                         tick("WAITING_OPEN", f"座位 {seat} 和时段已准备，等待开抢")
                         page.wait_for_timeout(250)
-                    tick("RUNNING", "提交前核对已有预约")
-                    existing, held_seat, detail = lookup()
-                    if existing == "exact":
-                        return BrowserResult("SKIPPED", "ALREADY_BOOKED_ON_SERVER", detail, held_seat)
-                    if existing != "absent":
-                        return BrowserResult("NEEDS_VERIFICATION", "BROWSER_PRECHECK_FAILED", detail)
+                    # Deliberately NO reservation-list lookup here. The official
+                    # seat page never calls that endpoint, so a call at this
+                    # instant is an off-script request sitting directly on the
+                    # critical path — roughly one round trip between the
+                    # platform's opening moment and our click.
+                    #
+                    # The pre-fire check above already answered the question
+                    # that matters ("do we already hold this interval?"), and at
+                    # the opening moment this account's own list is empty by
+                    # definition. A booking made elsewhere in the gap is still
+                    # caught by the platform's own refusal (seat taken) and by
+                    # the post-submit reconciliation.
                     submission_baseline = last_lookup_items
                     # Re-read all selected values after waiting/user interaction.
                     button, fid = adapter.prepare(values, day, seat)
@@ -1004,8 +1100,9 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                     # before announcing a human challenge. An ordinary network
                     # event must not flash the window or sound an alert.
                     automatic_until = min(deadline, time.monotonic() + 1)
-                    while (not gate.pending and not gate.rejected and not gate.terminal_code
-                           and time.monotonic() < automatic_until):
+                    while (not gate.pending and not gate.rejected
+                           and gate.refresh_serial == refresh_seen
+                           and not gate.terminal_code and time.monotonic() < automatic_until):
                         if adapter.needs_user():
                             break
                         tick('RUNNING', '等待官方提交或验证提示')
@@ -1013,15 +1110,20 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                     # A challenge can be returned by the submit response itself.
                     # In that case the same official flow is allowed to continue
                     # after human verification; it must not fall through to an
-                    # unknown result or rotate to another seat.
+                    # unknown result or rotate to another seat. An explicit
+                    # "refresh and resubmit" refusal is handled the same way —
+                    # the seat loop reloads the page and re-sends this seat.
                     result = None
                     while True:
-                        while not gate.pending and not gate.rejected and not gate.terminal_code:
+                        while (not gate.pending and not gate.rejected
+                               and gate.refresh_serial == refresh_seen and not gate.terminal_code):
                             if gate.blocked_reason:
                                 return BrowserResult("NEEDS_VERIFICATION", "BROWSER_INTENT_CHANGED", gate.blocked_reason)
                             message = gate.challenge_message or f"座位 {seat}：请在原窗口完成验证码或官方确认；系统等待提交结果"
                             tick("WAITING_USER", message)
                             page.wait_for_timeout(250)
+                        if gate.refresh_serial != refresh_seen:
+                            break
                         if gate.rejected:
                             break
                         if gate.terminal_code:
@@ -1032,11 +1134,18 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                         # answer enters read-only reconciliation.
                         until = time.monotonic() + 2
                         while (time.monotonic() < until and not gate.rejected
-                               and not gate.challenge_pending and not gate.terminal_code):
+                               and not gate.challenge_pending
+                               and gate.refresh_serial == refresh_seen
+                               and not gate.terminal_code):
                             tick("VERIFYING", "已发送预约，等待官方响应", checking=True)
                             if page.is_closed():
                                 break
                             page.wait_for_timeout(100)
+                        if gate.refresh_serial != refresh_seen:
+                            # Leave the wait loop so the seat loop can reload the
+                            # page and re-send this seat with a fresh token.
+                            result = None
+                            break
                         if gate.challenge_pending:
                             continue
                         if gate.terminal_code:
@@ -1046,16 +1155,41 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                         if result is None:
                             continue
                         break
-                    if gate.rejected:
+                    if gate.refresh_serial != refresh_seen:
+                        # The platform refused this request and explicitly asked
+                        # for a refresh plus a resubmit. Re-enter the SAME seat
+                        # immediately so the whole per-seat flow (fresh page
+                        # load, fresh token, duplicate re-check before clicking)
+                        # runs again; ``refresh_pending`` is the explicit unlock
+                        # the gate consumes on the resubmit.
+                        retries = refresh_retries.get(seat, 0)
+                        if (retries < REFRESH_RETRY_LIMIT and time.monotonic() < deadline
+                                and not control.cancel.is_set()):
+                            refresh_retries[seat] = retries + 1
+                            tick("RUNNING", "官方要求刷新后重提：重新加载页面并再提交一次")
+                            pending_seats.appendleft(seat)
+                        else:
+                            last_rejection_code = "TOKEN_STALE"
+                            last_rejection_message = gate.refresh_message or "官方要求刷新后重提，已达重试上限"
+                            gate.refresh_pending = False
                         continue
-                    if gate.rejected and not control.cancel.is_set() and time.monotonic() < deadline:
+                    if gate.rejected:
+                        last_rejection_code = gate.rejection_code or "SEAT_UNAVAILABLE"
+                        last_rejection_message = gate.rejection_message
+                        if last_rejection_code == "RATE_LIMITED" and time.monotonic() < deadline:
+                            tick("RUNNING", "官方提示操作频繁，正在退避后检查下一候选")
+                            page.wait_for_timeout(min(RATE_LIMIT_BACKOFF_MS, max(0, (deadline - time.monotonic()) * 1000)))
                         continue
                     return result
                 if preview:
                     return BrowserResult("PROBE_DONE", "BROWSER_PREVIEW_READY", "浏览器演练通过：候选座位、日期、时段及提交控件均已检查；未提交预约")
-                return BrowserResult("FAILED", "SEAT_UNAVAILABLE", "官方明确拒绝了所有候选座位")
+                return BrowserResult(
+                    "FAILED",
+                    last_rejection_code or "SEAT_UNAVAILABLE",
+                    last_rejection_message or "官方明确拒绝了所有候选座位",
+                )
             except InterruptedError as exc:
-                if gate.pending:
+                if gate.pending or gate.terminal_code:
                     return reconcile()
                 return BrowserResult("SKIPPED", "BROWSER_CANCELLED", str(exc))
             except Exception as exc:
@@ -1063,12 +1197,12 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                 frames = traceback.extract_tb(exc.__traceback__)
                 logger.warning('browser run %s page failure %s at %s', run_id, type(exc).__name__,
                                ' > '.join(f'{Path(f.filename).name}:{f.lineno}' for f in frames[:5]))
-                if gate.pending:
+                if gate.pending or gate.terminal_code:
                     try:
                         return reconcile()
                     except Exception:
                         return BrowserResult("NEEDS_VERIFICATION", "SUBMIT_OUTCOME_UNKNOWN", "浏览器连接中断，提交结果未知，请到超星核实")
-                if page and page.is_closed():
+                if _browser_target_closed(page, exc):
                     return BrowserResult("SKIPPED", "BROWSER_WINDOW_CLOSED", "官方登录或预约窗口意外关闭")
                 return BrowserResult("NEEDS_VERIFICATION", "LOGIN_CHECK_FAILED" if checking_login else "BROWSER_PAGE_UNSUPPORTED",
                                      "官方登录状态检测失败，请检查网络；登录资料已保留" if checking_login else "浏览器页面或连接异常；请重新检查官方页面")

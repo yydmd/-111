@@ -154,11 +154,34 @@ def test_only_explicit_rejection_allows_next_seat(payload, rejected):
     assert gate.pending is not (rejected or challenged)
 
 
-@pytest.mark.parametrize("message,code", [
-    ("操作频繁，请稍后再试", "RATE_LIMITED"),
-    ("检测到异常操作，风控拦截", "BLOCKED_BY_RISK"),
+def test_seat_rejection_cannot_continue_when_checkpoint_fails():
+    gate = make_gate(checkpoint=lambda *args: args[2] is True)
+    gate.route(Route(intent()))
+    gate.response(SimpleNamespace(
+        url=br.ORIGIN + br.SUBMIT_PATH,
+        json=lambda: {"success": False, "msg": "座位已被预约"},
+    ))
+    assert gate.pending and not gate.rejected
+    assert gate.control.cancel.is_set()
+
+
+def test_target_closed_detection_survives_broken_page_probe():
+    class TargetClosedError(Exception):
+        pass
+
+    class BrokenPage:
+        def is_closed(self):
+            raise TargetClosedError()
+
+    assert br._browser_target_closed(BrokenPage(), RuntimeError("connection lost"))
+    assert br._browser_target_closed(None, TargetClosedError())
+
+
+@pytest.mark.parametrize("message,code,terminal", [
+    ("操作频繁，请稍后再试", "RATE_LIMITED", False),
+    ("检测到异常操作，风控拦截", "BLOCKED_BY_RISK", True),
 ])
-def test_risk_control_response_stops_without_trying_another_seat(message, code):
+def test_rate_limit_is_retryable_but_explicit_risk_is_terminal(message, code, terminal):
     checkpoints = []
     gate = make_gate(checkpoint=lambda *args: checkpoints.append(args) or True)
     gate.route(Route(intent()))
@@ -166,11 +189,42 @@ def test_risk_control_response_stops_without_trying_another_seat(message, code):
         url=br.ORIGIN + br.SUBMIT_PATH,
         json=lambda: {"success": False, "msg": message},
     ))
-    assert gate.terminal_code == code
-    assert gate.terminal_message
-    assert not gate.pending and not gate.rejected
-    assert checkpoints[-1][0] == "BLOCKED_BY_RISK"
+    assert gate.terminal_code == (code if terminal else None)
+    assert bool(gate.terminal_message) is terminal
+    assert not gate.pending
+    assert gate.rejected is not terminal
+    assert gate.rejection_code == (None if terminal else code)
+    assert checkpoints[-1][0] == ("BLOCKED_BY_RISK" if terminal else "RUNNING")
     assert checkpoints[-1][2] is False
+
+
+def test_refresh_rejection_arms_one_same_seat_retry_without_loosening_attempted():
+    # The platform's 303 remedy ("refresh and resubmit") is an explicit refusal,
+    # not a risk verdict, so the same seat may be re-sent once — through the same
+    # explicit unlock the human challenge uses. ``attempted`` itself is never
+    # relaxed: once that unlock is consumed, the seat is blocked again.
+    gate = make_gate()
+    gate.route(Route(intent()))
+    assert gate.attempted == {"097"} and gate.pending
+    gate.response(SimpleNamespace(
+        url=br.ORIGIN + br.SUBMIT_PATH,
+        json=lambda: {"success": False,
+                      "msg": "您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约"},
+    ))
+    # Classified as a refreshable rejection, NOT as a human challenge, even
+    # though the wording contains 安全验证.
+    assert gate.refresh_pending and gate.refresh_serial == 1
+    assert not gate.challenge_pending and not gate.rejected and not gate.terminal_code
+    retry = Route(intent())
+    gate.route(retry)
+    assert retry.result == "sent" and not gate.refresh_pending
+    # Unlock consumed: pending cleared, a third send for the same seat is still
+    # refused by the attempted guard.
+    gate.pending = False
+    gate.sent_seat = "097"
+    third = Route(intent())
+    gate.route(third)
+    assert third.result == "blocked"
 
 
 def test_gate_records_secret_free_timing_and_meets_local_p95_budget():
@@ -186,11 +240,51 @@ def test_gate_records_secret_free_timing_and_meets_local_p95_budget():
         timing = gate.attempt_timings[0]
         assert set(timing) == {
             "seat", "click_to_request_ms", "gate_handler_ms",
-            "request_to_response_ms", "_route_finished_ns",
+            "request_to_response_ms", "_route_finished_ns", "_request",
         }
         assert "token" not in str(timing).lower()
         measurements.append(timing["gate_handler_ms"])
     assert sorted(measurements)[949] <= 10
+
+
+def test_blocked_submit_consumes_click_timing():
+    gate = make_gate(preview=True)
+    gate.mark_click("097")
+    gate.route(Route(intent()))
+    assert gate._click_started is None
+
+    gate.preview = False
+    gate.armed_seat = "098"
+    route = Route(intent(seatNum="098"))
+    gate.route(route)
+    assert route.result == "sent"
+    assert "click_to_request_ms" not in gate.attempt_timings[0]
+
+
+def test_response_timing_is_attached_to_its_request_not_latest_attempt():
+    gate = make_gate()
+    first = Route(intent())
+    gate.route(first)
+    gate.pending = False
+    gate.challenge_pending = True
+    second = Route(intent())
+    gate.route(second)
+
+    first_response = SimpleNamespace(
+        url=br.ORIGIN + br.SUBMIT_PATH,
+        request=first.request,
+        json=lambda: {"success": True},
+    )
+    second_response = SimpleNamespace(
+        url=br.ORIGIN + br.SUBMIT_PATH,
+        request=second.request,
+        json=lambda: {"success": True},
+    )
+    gate.response(first_response)
+    assert "request_to_response_ms" in gate.attempt_timings[0]
+    assert "request_to_response_ms" not in gate.attempt_timings[1]
+    gate.response(second_response)
+    assert "request_to_response_ms" in gate.attempt_timings[1]
 
 
 def test_official_challenge_allows_one_same_seat_continuation_only():
@@ -246,8 +340,9 @@ def test_request_gate_registration_is_narrow_and_reversible():
     gate = make_gate()
     br.install_request_gate(context, gate)
     br.remove_request_gate(context, gate)
-    assert [item[1] for item in calls[:2]] == list(br.REQUEST_GATE_PATTERNS)
-    assert [item[1] for item in calls[2:]] == list(br.REQUEST_GATE_PATTERNS)
+    count = len(br.REQUEST_GATE_PATTERNS)
+    assert [item[1] for item in calls[:count]] == list(br.REQUEST_GATE_PATTERNS)
+    assert [item[1] for item in calls[count:]] == list(br.REQUEST_GATE_PATTERNS)
     assert all(item[1] != "**/*" for item in calls)
 
 
@@ -380,29 +475,55 @@ def test_browser_dispatch_snapshot_and_waiting_lifecycle(db_factory, monkeypatch
         assert db.get(ReservationRun, next_run).error_code == "UNRESOLVED_SUBMISSION"
 
 
-def test_browser_rate_limit_is_terminal_and_persisted_with_timing(db_factory, monkeypatch):
+def test_browser_rate_limit_is_retryable_failure_and_persisted_with_timing(db_factory, monkeypatch):
     from app import service
     calls = []
     def browser(run_id, account_id, values, day, fire, checkpoint, **kwargs):
         calls.append(values["seats"])
         assert checkpoint("VERIFYING", "预约请求即将发送", True, "097")
-        assert checkpoint("BLOCKED_BY_RISK", "官方提示操作频繁；已停止本次任务", False, "097")
+        assert checkpoint("RUNNING", "官方提示操作频繁；已退避并继续检查下一候选", False, "097", "RATE_LIMITED")
         return br.BrowserResult(
-            "BLOCKED_BY_RISK", "RATE_LIMITED", "官方提示操作频繁；已停止本次任务", "097",
+            "FAILED", "RATE_LIMITED", "官方提示操作频繁；已退避并继续检查下一候选", "097",
             attempt_timings=[{"seat": "097", "gate_handler_ms": 0.5}],
         )
     monkeypatch.setattr(br, "run_browser", browser)
     run_id = service.execute_plan(1)
     with db_factory() as db:
         run = db.get(ReservationRun, run_id)
-        assert run.status == "BLOCKED_BY_RISK" and run.error_code == "RATE_LIMITED"
+        assert run.status == "FAILED" and run.error_code == "RATE_LIMITED"
         assert not run.possibly_submitted
         assert run.attempt_details == [{
             "seat": "097", "source": "browser", "submitted": True,
-            "code": "RATE_LIMITED", "message": "官方提示操作频繁；已停止本次任务",
+            "code": "RATE_LIMITED", "message": "官方提示操作频繁；已退避并继续检查下一候选",
             "timing": {"gate_handler_ms": 0.5},
         }]
     assert calls == [["097"]]
+
+
+def test_terminal_risk_checkpoint_survives_window_close_without_replay(db_factory, monkeypatch):
+    from app import service
+    calls = []
+
+    def browser(*args, **kwargs):
+        calls.append(args[0])
+        checkpoint = args[5]
+        assert checkpoint(
+            "BLOCKED_BY_RISK",
+            "官方拒绝本次操作；已停止本次任务，不再换座或追加请求",
+            False,
+            "097",
+            "BLOCKED_BY_RISK",
+        )
+        return br.BrowserResult("SKIPPED", "BROWSER_WINDOW_CLOSED", "窗口意外关闭")
+
+    monkeypatch.setattr(br, "run_browser", browser)
+    run_id = service.execute_plan(1)
+    with db_factory() as db:
+        run = db.get(ReservationRun, run_id)
+        assert run.status == "BLOCKED_BY_RISK"
+        assert run.error_code == "BLOCKED_BY_RISK"
+        assert not run.possibly_submitted
+    assert len(calls) == 1
 
 
 def test_direct_preview_of_api_plan_never_uses_submit_client(db_factory, monkeypatch):
@@ -539,6 +660,22 @@ def test_official_risk_token_request_bypasses_python_gate(page_fixture):
     assert routed == [br.ORIGIN + br.SUBMIT_PATH]
 
 
+def test_nested_unknown_seat_mutation_is_still_blocked(page_fixture):
+    page, context, _ = page_fixture
+    gate = make_gate()
+    br.install_request_gate(context, gate)
+    page.goto(br.ORIGIN + "/front/third/apps/seat/select")
+    result = page.evaluate("""async () => {
+      try {
+        const response = await fetch('/front/third/apps/data/apps/seat/cancel', {method:'POST'});
+        return `sent:${response.status}`;
+      } catch (_) {
+        return 'blocked';
+      }
+    }""")
+    assert result == "blocked"
+
+
 def test_real_browser_adapter_rejects_wrong_day_or_missing_control(page_fixture):
     page, _, _ = page_fixture
     page.goto(br.ORIGIN + "/front/third/apps/seat/select")
@@ -568,11 +705,15 @@ def test_official_not_open_notice_is_not_a_login_or_adapter_failure(page_fixture
     ("adjacent_merge", "SUCCESS"), ("seat_fallback", "SUCCESS"),
     ("response_captcha", "SUCCESS"), ("late_response_captcha", "SUCCESS"), ("direct_submit", "SUCCESS"),
     ("scheduled_direct", "SUCCESS"), ("scheduled_stale_date", "SUCCESS"),
-    ("rate_response", "BLOCKED_BY_RISK"), ("risk_response", "BLOCKED_BY_RISK")])
+    ("rate_response", "FAILED"), ("rate_then_success", "SUCCESS"),
+    ("stale_plain", "FAILED"), ("stale_security", "SUCCESS"),
+    ("stale_redirect", "NEEDS_VERIFICATION"),
+    ("risk_response", "BLOCKED_BY_RISK")])
 def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, monkeypatch, mode, expected):
     page, context, sent = page_fixture
     import playwright.sync_api
     list_reads_after_send = [0]
+    list_reads_before_send = [0]
     # The real browser runs all page interactions. Only its HTTP API transport
     # is replaced; no test request can reach a real reservation service.
     class Proxy:
@@ -584,10 +725,12 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
                 if mode == "late_response_captcha" and late_response["response"] is not None and not late_response["released"]:
                     late_response["released"] = True
                     original_gate_response(late_response["gate"], late_response["response"])
-                items = [record()] if mode == "existing_disabled" or (sent and mode in {"success", "scheduled_open", "early_captcha", "direct_submit", "scheduled_direct", "scheduled_stale_date"}) or (mode in {"response_captcha", "late_response_captcha"} and len(sent) >= 2) else []
+                items = [record(seatNum="098" if mode == "rate_then_success" else "097")] if mode == "existing_disabled" or (sent and mode in {"success", "scheduled_open", "early_captcha", "direct_submit", "scheduled_direct", "scheduled_stale_date"}) or (mode in {"response_captcha", "late_response_captcha", "rate_then_success", "stale_security"} and len(sent) >= 2) else []
                 if sent and mode == 'list_delay':
                     list_reads_after_send[0] += 1
                     items = [record()] if list_reads_after_send[0] >= 2 else []
+                elif not sent:
+                    list_reads_before_send[0] += 1
                 if sent and mode == 'merged':
                     tz = dt.timezone(dt.timedelta(hours=8))
                     items = [record(
@@ -643,12 +786,37 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
             route.fulfill(json={"success": len(sent) >= 2,
                                 "msg": "成功" if len(sent) >= 2 else "请完成安全验证"})
         context.route(br.ORIGIN + br.SUBMIT_PATH, challenge_then_success)
-    if mode in {'rate_response', 'risk_response'}:
+    if mode in {'rate_response', 'rate_then_success', 'risk_response'}:
+        if mode == 'rate_then_success':
+            def candidate_page(route):
+                seat = parse_qs(urlparse(route.request.url).query)['seatNum'][0]
+                route.fulfill(body=HTML.replace("chosedSeatNum:'097'", f"chosedSeatNum:'{seat}'"), content_type='text/html')
+            context.route(br.ORIGIN + '/front/third/apps/seat/select?**', candidate_page)
         def reject_for_risk(route):
             sent.append(route.request.post_data)
-            message = "操作频繁，请稍后再试" if mode == 'rate_response' else "检测到异常操作，风控拦截"
-            route.fulfill(json={"success": False, "msg": message})
+            if mode == 'rate_then_success' and len(sent) >= 2:
+                route.fulfill(json={"success": True, "msg": "成功"})
+            else:
+                message = "操作频繁，请稍后再试" if mode != 'risk_response' else "检测到异常操作，风控拦截"
+                route.fulfill(json={"success": False, "msg": message})
         context.route(br.ORIGIN + br.SUBMIT_PATH, reject_for_risk)
+    if mode in {'stale_plain', 'stale_security', 'stale_redirect'}:
+        # P0: the platform's 303 remedy ("page sat too long, refresh and
+        # resubmit"). Three real-world shapes are probed here because the gate
+        # classifies on message text: the platform's wording contains
+        # "安全验证", which the gate may read as a human challenge rather than
+        # as a refreshable rejection.
+        stale_message = ("您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约"
+                         if mode == 'stale_security' else "您在页面停留过久，请刷新后再提交预约")
+        def stale_submit(route):
+            sent.append(route.request.post_data)
+            if mode == 'stale_redirect':
+                route.fulfill(status=303, headers={"Location": "https://passport2.chaoxing.com/login"})
+            elif mode == 'stale_security' and len(sent) >= 2:
+                route.fulfill(json={"success": True, "msg": "成功"})
+            else:
+                route.fulfill(json={"success": False, "msg": stale_message})
+        context.route(br.ORIGIN + br.SUBMIT_PATH, stale_submit)
     direct_html = HTML.replace(
         "document.querySelector('.time_sure').onclick=()=>document.querySelector('#human').hidden=false;",
         "document.querySelector('.time_sure').onclick=()=>send();",
@@ -700,8 +868,10 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
             return original_state(adapter)
         monkeypatch.setattr(br.PageAdapter, "state", delayed_state)
     seen = []
+    seen_full = []
     def checkpoint(status, message, submitted, *args):
         seen.append((status, submitted))
+        seen_full.append((status, submitted, *args))
         if mode in {"scheduled_open", "scheduled_direct", "scheduled_stale_date"} and status == "WAITING_OPEN":
             assert not sent
             server_now[0] = fire_epoch + 0.1
@@ -732,18 +902,55 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
                 page.close()
             elif mode in {"response_captcha", "late_response_captcha"} and len(sent) == 1:
                 page.locator("#human").click()
-            elif not sent or (mode == 'seat_fallback' and len(sent) == 1):
+            elif not sent or mode in {'rate_then_success', 'stale_security', 'stale_plain'} or (mode == 'seat_fallback' and len(sent) == 1):
+                # rate_then_success / stale_* must let the human step fire on
+                # every attempt: the first seat is throttled or refused with
+                # "refresh and resubmit", and the follow-up attempt (after the
+                # gate's back-off / page reload) must still be driven, not left
+                # waiting forever.
                 page.locator("#human").click()
         return True
     values = {**VALUES, "seats": ["097"], "username": "user"}
-    if mode == 'seat_fallback':
+    if mode in {'seat_fallback', 'rate_then_success'}:
         values['seats'] = ['097', '098']
     result = br.run_browser(42, 1, values, DAY, fire_epoch, checkpoint,
                            preview=mode == "preview" or mode.startswith("qr_"), check_only=mode == "recheck")
     assert result.status == expected, result
-    assert len(sent) == (2 if mode in {'seat_fallback', 'response_captcha', 'late_response_captcha'} else 1 if mode in {"success", "unknown", "scheduled_open", "scheduled_direct", "scheduled_stale_date", "direct_submit", "early_captcha", "list_delay", "merged", "adjacent_merge", "rate_response", "risk_response"} else 0)
+    stale_sends = {'stale_plain': 2, 'stale_redirect': 1, 'stale_security': 2}
+    if mode in stale_sends:
+        assert len(sent) == stale_sends[mode], (mode, len(sent))
+    else:
+        assert len(sent) == (2 if mode in {'seat_fallback', 'response_captcha', 'late_response_captcha', 'rate_then_success'} else 1 if mode in {"success", "unknown", "scheduled_open", "scheduled_direct", "scheduled_stale_date", "direct_submit", "early_captcha", "list_delay", "merged", "adjacent_merge", "rate_response", "risk_response"} else 0)
+    if mode in {'stale_plain', 'stale_security'}:
+        # P0/P2-1: the platform's "refresh and resubmit" refusal is now an
+        # explicit, bounded automatic retry — the same seat is reloaded and
+        # re-sent exactly once, without waiting for a human.
+        assert any(entry[0] == 'RUNNING' and entry[1] is False and entry[-1] == 'TOKEN_STALE'
+                   for entry in seen_full), seen_full
+        # The wording contains 安全验证; proving the challenge branch was NOT
+        # taken is what makes this an automatic retry, not a human wait.
+        assert not any(status == 'WAITING_USER' and submitted is False
+                       for status, submitted, *_ in seen_full)
+    if mode == 'stale_plain':
+        # The retry is refused too, so the seat is reported honestly as stale
+        # rather than as an unknown outcome or as "seat taken".
+        assert result.code == 'TOKEN_STALE'
+    if mode == 'stale_security':
+        # The retry is accepted: recovery inside the opening window.
+        assert result.code is None and len(sent) == 2
+    if mode == 'stale_redirect':
+        # Known limitation: a bodyless 3xx on the submit path carries no text
+        # for the gate to classify, so it still degrades to an unknown outcome.
+        assert len(sent) == 1
+        assert result.code == 'SUBMIT_OUTCOME_UNKNOWN'
     if mode == 'list_delay':
         assert list_reads_after_send[0] == 2
+    if mode == 'success':
+        # Exactly one reservation-list read before the submit — the pre-fire
+        # check. The old post-fire re-check sat on the critical path (an
+        # off-script request roughly one round trip before the click, on an
+        # endpoint the official seat page never calls) and has been removed.
+        assert list_reads_before_send[0] == 1, list_reads_before_send[0]
     if mode == 'seat_fallback':
         assert [parse_qs(body)['seatNum'][0] for body in sent] == ['097', '098']
     if mode == 'merged':
