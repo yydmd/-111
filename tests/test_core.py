@@ -732,7 +732,7 @@ def test_failed_clock_calibration_retries_before_success_ttl(monkeypatch):
         refreshes.append(now[0])
         return 0.0
 
-    monkeypatch.setattr(clock, "refresh", fake_refresh)
+    monkeypatch.setattr(clock, "refresh_async", fake_refresh)
     now[0] += clock.FAILURE_RETRY_SECONDS - 1
     assert clock.server_offset() == 0.0 and not refreshes
     now[0] += 2
@@ -2054,8 +2054,8 @@ def test_next_run_at_reads_live_scheduler():
         web.scheduler.shutdown(wait=False)
 
 
-def test_next_run_at_shows_today_during_catchup_window():
-    """准备时刻已过但执行时刻仍在今天时，页面不能跳成明天。"""
+def test_next_run_at_does_not_invent_a_catchup_without_a_queued_run():
+    """预热窗口本身不证明补跑已入队；不能承诺一个不存在的今日任务。"""
     from types import SimpleNamespace
 
     import app.web as web
@@ -2069,7 +2069,7 @@ def test_next_run_at_shows_today_during_catchup_window():
         web.scheduler.start(paused=True)
         web.scheduler.add_job(lambda: None, DateTrigger(run_date=tomorrow_job),
                               id="plan-999912", replace_existing=True)
-        assert datetime.fromisoformat(web._next_run_at(plan, now)).date() == now.date()
+        assert datetime.fromisoformat(web._next_run_at(plan, now)) == tomorrow_job + timedelta(seconds=600)
     finally:
         try:
             web.scheduler.remove_job("plan-999912")

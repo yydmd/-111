@@ -5,6 +5,28 @@ ACTIVE_STATUSES = ("PENDING", "RUNNING", "WAITING_LOGIN", "WAITING_OPEN", "WAITI
 BROWSER_RUN_SECONDS = 300
 VERIFY_SECONDS = 20
 HEARTBEAT_GRACE_SECONDS = 30
+PREPARE_LEAD_SECONDS = 600
+WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+SCHEDULED_TRIGGERS = ("scheduled", "scheduled_catchup")
+
+
+def weekday_name(moment):
+    return WEEKDAY_NAMES[moment.weekday()]
+
+
+def scheduled_opening(run_time, current, lead_seconds=PREPARE_LEAD_SECONDS):
+    hour, minute = map(int, run_time.split(":"))
+    opening = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if 0 < (opening + timedelta(days=1) - current).total_seconds() <= lead_seconds:
+        opening += timedelta(days=1)
+    return opening
+
+
+def known_unsubmitted_browser_run(run):
+    """Only repair historical browser rows with no evidence of a released POST."""
+    return (not run.possibly_submitted
+            and run.request_snapshot.get("execution_mode") == "browser"
+            and not any(not isinstance(item, dict) or item.get("submitted") for item in run.attempt_details))
 
 
 def live_browser_run(heartbeat, expires, now=None):

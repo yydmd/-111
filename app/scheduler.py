@@ -10,7 +10,8 @@ from sqlalchemy import select
 
 from .db import Account, ReservationPlan, ReservationRun, SessionLocal
 from .service import enqueue_plan, _reservation_fingerprint
-from .run_state import ACTIVE_STATUSES
+from .run_state import (ACTIVE_STATUSES, PREPARE_LEAD_SECONDS, SCHEDULED_TRIGGERS,
+                        scheduled_opening, weekday_name, known_unsubmitted_browser_run)
 
 logger = logging.getLogger(__name__)
 # A short wake-up delay should not throw away an opening-window reservation, but
@@ -20,7 +21,20 @@ STARTUP_CATCHUP_SECONDS = 90
 # Scheduled plans wake up this many seconds before their run time so login and
 # page warm-up finish before the platform's opening moment; the submit itself
 # still waits for the (server-aligned) run time inside the run.
-LEAD_SECONDS = 600
+LEAD_SECONDS = PREPARE_LEAD_SECONDS
+_catchup_status: dict[int, dict] = {}
+
+
+def catchup_status(plan):
+    item = _catchup_status.get(plan.id)
+    if not item:
+        return None
+    current = dt.datetime.now(ZoneInfo("Asia/Shanghai"))
+    opening = scheduled_opening(plan.run_time, current)
+    fingerprint = _reservation_fingerprint(plan, opening.date() + dt.timedelta(days=plan.day_offset))
+    if item["opening_at"] != opening.isoformat() or item["fingerprint"] != fingerprint:
+        return None
+    return {key: value for key, value in item.items() if key != "fingerprint"}
 
 
 def _fire_time_of_day(run_time: str) -> tuple[int, int, int]:
@@ -86,19 +100,20 @@ def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
         statement = select(ReservationPlan).join(Account).where(ReservationPlan.enabled.is_(True), Account.enabled.is_(True))
         for plan in db.scalars(statement):
             try:
-                hour, minute = map(int, plan.run_time.split(':'))
-                opening = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if 0 < (opening + dt.timedelta(days=1) - current).total_seconds() <= LEAD_SECONDS:
-                    opening += dt.timedelta(days=1)
+                opening = scheduled_opening(plan.run_time, current, LEAD_SECONDS)
                 scheduled_at = opening - dt.timedelta(seconds=LEAD_SECONDS)
             except ValueError:
                 continue
             delay = (current - scheduled_at).total_seconds()
-            if opening.strftime('%A') not in plan.weekdays or not 0 < delay <= LEAD_SECONDS + STARTUP_CATCHUP_SECONDS:
+            if weekday_name(opening) not in plan.weekdays or not 0 <= delay <= LEAD_SECONDS + STARTUP_CATCHUP_SECONDS:
                 continue
             target_date = (opening.date() + dt.timedelta(days=plan.day_offset)).isoformat()
             fingerprint = _reservation_fingerprint(
                 plan, opening.date() + dt.timedelta(days=plan.day_offset))
+            def decision(state, message, run_id=None):
+                _catchup_status[plan.id] = {"state": state, "message": message,
+                    "run_id": run_id, "opening_at": opening.isoformat(), "fingerprint": fingerprint}
+                logger.info("Plan %s catch-up %s: %s", plan.id, state, message)
             # Only an IN-FLIGHT run (PENDING/RUNNING) or an already SUCCESSFUL
             # one for this plan+target-day counts as "already created".
             # Matching any historical row once swallowed this catch-up on
@@ -120,24 +135,47 @@ def _enqueue_recently_missed_jobs(now: dt.datetime | None = None) -> int:
             )
             if already_created:
                 logger.info("Plan %s fire moment just passed but run %s is already in flight; no catch-up needed", plan.id, already_created)
+                decision("existing", f"本次已有预约任务 #{already_created}", already_created)
                 continue
             unresolved = db.scalar(select(ReservationRun.id).where(
                 ReservationRun.account_id == plan.account_id,
                 ReservationRun.target_date == target_date,
                 ReservationRun.possibly_submitted.is_(True)).limit(1))
             if unresolved:
+                decision("blocked", f"任务 #{unresolved} 可能已提交，尚未核实；本次补跑被阻止", unresolved)
                 continue
-            interrupted = db.scalar(select(ReservationRun.id).where(
+            interrupted = next((old.id for old in db.scalars(select(ReservationRun).where(
                 ReservationRun.account_id == plan.account_id,
                 ReservationRun.target_date == target_date,
-                ReservationRun.error_code == "INTERRUPTED_NEEDS_VERIFICATION").limit(1))
+                ReservationRun.error_code == "INTERRUPTED_NEEDS_VERIFICATION"))
+                if not known_unsubmitted_browser_run(old)), None)
             if interrupted:
+                decision("blocked", f"历史任务 #{interrupted} 缺少安全重试证据；请先核实预约", interrupted)
                 continue
+            cancelled = next((old.id for old in db.scalars(select(ReservationRun).where(
+                ReservationRun.plan_id == plan.id,
+                ReservationRun.request_fingerprint == fingerprint,
+                ReservationRun.trigger.in_(SCHEDULED_TRIGGERS),
+                ReservationRun.error_code == "BROWSER_CANCELLED"))
+                if old.request_snapshot.get("opening_at") == opening.isoformat()), None)
+            if cancelled:
+                decision("cancelled", f"本次任务 #{cancelled} 已主动取消，不会自动补跑", cancelled)
+                continue
+            decision("queued", "本次补跑正在入队")
             plan_ids.append(plan.id)
     finally:
         db.close()
+    accepted = 0
     for plan_id in plan_ids:
-        enqueue_plan(plan_id, "scheduled_catchup")
-    if plan_ids:
-        logger.warning("Queued %s recently missed reservation job(s) after service startup", len(plan_ids))
-    return len(plan_ids)
+        try:
+            run_id = enqueue_plan(plan_id, "scheduled_catchup")
+            accepted += 1
+            _catchup_status[plan_id] = {**_catchup_status[plan_id], "run_id": run_id,
+                                      "message": f"已创建补跑任务 #{run_id}"}
+        except Exception:
+            _catchup_status[plan_id] = {**_catchup_status[plan_id], "state": "failed",
+                                      "message": "补跑入队失败，请查看服务日志"}
+            logger.exception("Plan %s catch-up enqueue failed", plan_id)
+    if accepted:
+        logger.warning("Queued %s recently missed reservation job(s)", accepted)
+    return accepted

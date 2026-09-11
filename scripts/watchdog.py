@@ -28,6 +28,7 @@ import requests
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app.run_state import ACTIVE_STATUSES, live_browser_run
+from app.single_instance import mutex_api
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 PYTHON = PYTHON if PYTHON.exists() else Path(sys.executable)
 SERVICE_COMMAND = [str(PYTHON), "-u", "main.py", "-m", "serve"]
@@ -67,11 +68,12 @@ def acquire_watchdog_mutex() -> bool:
         return True
     identity = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".encode("utf-8")
     suffix = hashlib.sha256(identity).hexdigest()[:16]
-    _watchdog_mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, False, f"Local\\ChaoxingSeatWatchdog-{suffix}")
+    kernel = mutex_api()
+    _watchdog_mutex_handle = kernel.CreateMutexW(None, False, f"Local\\ChaoxingSeatWatchdog-{suffix}")
     if not _watchdog_mutex_handle:
         return False
-    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-        ctypes.windll.kernel32.CloseHandle(_watchdog_mutex_handle)
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        kernel.CloseHandle(_watchdog_mutex_handle)
         _watchdog_mutex_handle = None
         return False
     return True
@@ -80,7 +82,7 @@ def acquire_watchdog_mutex() -> bool:
 def release_watchdog_mutex() -> None:
     global _watchdog_mutex_handle
     if _watchdog_mutex_handle:
-        ctypes.windll.kernel32.CloseHandle(_watchdog_mutex_handle)
+        mutex_api().CloseHandle(_watchdog_mutex_handle)
         _watchdog_mutex_handle = None
 
 

@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from . import chaoxing_client as _chaoxing_client
 from . import clock as app_clock
@@ -19,7 +19,9 @@ from .notify import submit_async as notify_async
 from .db import Account, AppSetting, ReservationPlan, ReservationRun, SessionLocal
 from .security import decrypt_password, redact
 from .validation import normalize_time, validate_reservation_time_range
-from .run_state import ACTIVE_STATUSES, BROWSER_RUN_SECONDS, live_browser_run
+from .run_state import (ACTIVE_STATUSES, BROWSER_RUN_SECONDS, live_browser_run,
+                        SCHEDULED_TRIGGERS, scheduled_opening, weekday_name,
+                        known_unsubmitted_browser_run)
 
 logger = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -121,7 +123,7 @@ def _target_day(plan: ReservationPlan, now: dt.datetime | None = None) -> dt.dat
 
 
 def _today_enabled(plan: ReservationPlan, now: dt.datetime | None = None) -> bool:
-    return (now or now_shanghai()).strftime("%A") in plan.weekdays
+    return weekday_name(now or now_shanghai()) in plan.weekdays
 
 
 def _opening_at(plan: ReservationPlan, now: dt.datetime | None = None) -> dt.datetime | None:
@@ -145,8 +147,7 @@ def _run_snapshot(plan: ReservationPlan, trigger: str) -> ReservationRun:
     opening = _opening_at(plan)
     if trigger in {'scheduled', 'scheduled_catchup'} and opening:
         current = now_shanghai()
-        if opening < current and 0 <= (opening + dt.timedelta(days=1) - current).total_seconds() <= 600:
-            opening += dt.timedelta(days=1)
+        opening = scheduled_opening(plan.run_time, current)
         target_day = opening.date() + dt.timedelta(days=plan.day_offset)
     request_snapshot = {
         "room_id": plan.room_id.strip(),
@@ -205,8 +206,12 @@ def enqueue_plan(
                 ReservationRun.status.in_(ACTIVE_STATUSES))).all()
             run = _run_snapshot(plan, trigger)
             for active in active_runs:
-                if active.trigger != 'account_login' and active.plan_id == plan.id and active.target_date == run.target_date and (
-                        active.trigger == trigger or trigger in {'scheduled', 'scheduled_catchup'}):
+                same_kind = active.trigger == trigger or (
+                    active.trigger in SCHEDULED_TRIGGERS and trigger in SCHEDULED_TRIGGERS)
+                same_opening = (trigger not in SCHEDULED_TRIGGERS or
+                                active.request_snapshot.get("opening_at") == run.request_snapshot.get("opening_at"))
+                if (same_kind and same_opening and active.plan_id == plan.id
+                        and active.request_fingerprint == run.request_fingerprint):
                     return active.id
             if not probe_only:
                 snapshot = run.request_snapshot
@@ -229,11 +234,20 @@ def enqueue_plan(
             run_id = run.id
         finally:
             db.close()
-    if probe_only:
-        _executor.submit(execute_plan, plan_id, trigger, probe_only=True, run_id=run_id, override_duplicate=override_duplicate)
-    else:
-        from .browser_sessions import submit
-        submit(run.account_id, execute_plan, plan_id, trigger, run_id=run_id, override_duplicate=override_duplicate)
+    try:
+        if probe_only:
+            _executor.submit(execute_plan, plan_id, trigger, probe_only=True, run_id=run_id, override_duplicate=override_duplicate)
+        else:
+            from .browser_sessions import submit
+            submit(run.account_id, execute_plan, plan_id, trigger, run_id=run_id, override_duplicate=override_duplicate)
+    except Exception:
+        with SessionLocal() as db:
+            db.execute(update(ReservationRun).where(
+                ReservationRun.id == run_id, ReservationRun.status == "PENDING").values(
+                status="FAILED", error_code="ENQUEUE_FAILED", message="任务入队失败，未启动预约",
+                finished_at=datetime.now(dt.UTC).replace(tzinfo=None)))
+            db.commit()
+        raise
     return run_id
 
 
@@ -261,9 +275,37 @@ def enqueue_login(account_id):
     return run_id
 
 
+def cancel_pending_run(run_id):
+    """Atomically cancel a queued job before its worker claims it."""
+    with SessionLocal() as db:
+        result = db.execute(update(ReservationRun).where(
+            ReservationRun.id == run_id, ReservationRun.status == "PENDING",
+            ReservationRun.possibly_submitted.is_(False)).values(
+                status="SKIPPED", error_code="BROWSER_CANCELLED", message="已取消排队任务，未提交预约",
+                finished_at=datetime.now(dt.UTC).replace(tzinfo=None)))
+        db.commit()
+        if result.rowcount:
+            run = db.get(ReservationRun, run_id)
+            if run.trigger == "account_login":
+                account = db.get(Account, run.account_id)
+                if account:
+                    account.login_status, account.login_message = "UNKNOWN", "登录检查已取消"
+                    db.commit()
+        return bool(result.rowcount)
+
+
+def _claim_pending(db, run_id):
+    result = db.execute(update(ReservationRun).where(
+        ReservationRun.id == run_id, ReservationRun.status == "PENDING").values(status="RUNNING"))
+    db.commit()
+    return bool(result.rowcount)
+
+
 def execute_login(run_id):
     from .browser_reserve import run_browser
     with SessionLocal() as db:
+        if not _claim_pending(db, run_id):
+            return
         run = db.get(ReservationRun, run_id)
         account = db.get(Account, run.account_id)
         if not account or not account.enabled:
@@ -342,7 +384,8 @@ def _merge_browser_attempt_timings(run: ReservationRun, timings: list[dict]) -> 
     details = run.attempt_details
     if not details or not timings:
         return
-    allowed = {"click_to_request_ms", "gate_handler_ms", "request_to_response_ms"}
+    allowed = {"click_to_request_ms", "gate_handler_ms", "request_to_response_ms",
+               "fire_to_click_ms", "fire_to_request_ms"}
     used: set[int] = set()
     for measurement in timings:
         seat = str(measurement.get("seat") or "")
@@ -994,6 +1037,14 @@ def recover_interrupted_runs(*, startup: bool = False) -> int:
             )
         ).all()
         now = datetime.now(dt.UTC).replace(tzinfo=None)
+        repaired = 0
+        for old in db.scalars(select(ReservationRun).where(
+                ReservationRun.error_code == "INTERRUPTED_NEEDS_VERIFICATION",
+                ReservationRun.possibly_submitted.is_(False))):
+            if known_unsubmitted_browser_run(old):
+                old.status, old.error_code = "FAILED", "INTERRUPTED_SAFE_TO_RETRY"
+                old.message = "历史中断误标已修正：浏览器记录确认未放行提交，可在有效调度窗口内安全补跑"
+                repaired += 1
         from .browser_sessions import owns_account
         stale = [run for run in stale if startup or
                  (not (run.status == 'PENDING' and owns_account(run.account_id)) and
@@ -1009,7 +1060,7 @@ def recover_interrupted_runs(*, startup: bool = False) -> int:
                 run.message = "服务在提交前中断；未发现未核实提交，可由调度器安全补跑"
             run.finished_at = now
         db.commit()
-        return len(stale)
+        return len(stale) + repaired
     finally:
         db.close()
 
@@ -1085,6 +1136,7 @@ def _execute_browser(db, plan, account, run, values):
 
     def checkpoint(status, message, submitted, seat=None, code=None):
         nonlocal last_commit, terminal_checkpoint
+        message = redact(message)
         current = time.monotonic()
         changed = run.status != status or run.message != message or submitted is not None
         if changed or current - last_commit >= 2:
@@ -1114,6 +1166,9 @@ def _execute_browser(db, plan, account, run, values):
                 run.selected_seat = seat
                 _append_attempt(run, seat=seat, source="browser", submitted=True,
                                 code="SUBMIT_OUTCOME_UNKNOWN", message="请求已放行，等待官方结果")
+            elif (submitted is False and code == "SEAT_UNAVAILABLE" and seat
+                  and (not run.attempt_details or run.attempt_details[-1].get("seat") != seat)):
+                _append_attempt(run, seat=seat, source="browser", submitted=False, code=code, message=message)
             elif submitted is False and run.attempt_details:
                 details = run.attempt_details
                 details[-1]["code"] = code if code is not None else (
@@ -1212,6 +1267,8 @@ def execute_plan(
     try:
         plan = db.get(ReservationPlan, plan_id)
         if run_id:
+            if not _claim_pending(db, run_id):
+                return run_id
             run = db.get(ReservationRun, run_id)
         if run is None:
             if not plan:
@@ -1242,7 +1299,7 @@ def execute_plan(
             _set_failure(run, "NO_CANDIDATE_SEAT", "未配置候选座位")
             return run.id
         opening = run.request_snapshot.get('opening_at')
-        weekday = datetime.fromisoformat(opening).strftime('%A') if opening else now_shanghai().strftime('%A')
+        weekday = weekday_name(datetime.fromisoformat(opening) if opening else now_shanghai())
         if trigger in {"scheduled", "scheduled_catchup"} and weekday not in request_values["weekdays"]:
             _set_failure(run, "WEEKDAY_NOT_ENABLED", "今天不在该计划的执行星期内")
             return run.id

@@ -132,4 +132,5 @@ test.json
 # Local application state and secrets
 data/
 .pytest_cache/
+.pytest_bugfix_*/
 .venv/

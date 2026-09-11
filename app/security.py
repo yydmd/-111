@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import base64
+import binascii
 import os
 import re
 import sys
@@ -41,7 +42,10 @@ _SECRET_PREFIX = "dpapi:v1:"
 
 def protect_secret(value: str) -> str:
     """Store a small local integration secret using the current user's DPAPI."""
-    encrypted = encrypt_password(value)
+    try:
+        encrypted = encrypt_password(value)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("通知密钥无法加密，请检查当前 Windows 用户环境") from exc
     return _SECRET_PREFIX + base64.urlsafe_b64encode(encrypted).decode("ascii")
 
 
@@ -50,10 +54,13 @@ def unprotect_secret(value: str) -> str:
     raw = str(value or "")
     if not raw.startswith(_SECRET_PREFIX):
         return raw
-    payload = base64.urlsafe_b64decode(raw[len(_SECRET_PREFIX):].encode("ascii"))
-    return decrypt_password(payload)
+    try:
+        payload = base64.b64decode(raw[len(_SECRET_PREFIX):].encode("ascii"), altchars=b"-_", validate=True)
+        return decrypt_password(payload)
+    except (OSError, RuntimeError, ValueError, UnicodeError, binascii.Error) as exc:
+        raise ValueError("通知密钥无法解密，请重新填写并保存") from exc
 
 
 def redact(value: str) -> str:
-    value = re.sub(r"([\"']?(?:password|passwd|captcha|token|cookie|enc)[\"']?\s*[:=]\s*[\"']?)[^,\s}\"']+", r"\1<redacted>", value, flags=re.I)
+    value = re.sub(r"(?<![\w])([\"']?(?:password|passwd|captcha|token|cookie|enc)[\"']?\s*[:=]\s*[\"']?)[^&,\s}\"']+", r"\1<redacted>", value, flags=re.I)
     return value[:2000]

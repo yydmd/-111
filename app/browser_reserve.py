@@ -34,6 +34,7 @@ ACCOUNT_URL = "https://passport2.chaoxing.com/mooc/accountManage"
 logger = logging.getLogger(__name__)
 SUBMIT_PATH = "/data/apps/seat/submit"
 READ_SEAT_PATHS = {"index", "room/info", "room/info/switch", "getusedtimes", "getusedseatnums", "address", "captcha"}
+READ_SEAT_GET_PATHS = {"getdrawseat", "seatgrid/roomid"}
 REQUEST_GATE_PATTERNS = (
     "https://passport2.chaoxing.com/fanyalogin**",
     re.compile(r"^https://office\.chaoxing\.com/(?:.*/)?data/apps/seat(?:/.*)?(?:\?.*)?$"),
@@ -67,6 +68,14 @@ class Control:
     focus: threading.Event = field(default_factory=threading.Event)
     awaiting_identity: str | None = None
     confirmed_identity: str | None = None
+
+
+class CandidateUnavailable(ValueError):
+    """The page is understood, but this candidate's requested slots are disabled."""
+
+
+class BrowserWindowClosed(InterruptedError):
+    pass
 
 
 def _browser_target_closed(page, exc: BaseException | None = None) -> bool:
@@ -415,6 +424,8 @@ class RequestGate:
         # unlock armed for the current attempt is not mistaken for a fresh
         # rejection arriving while that attempt is still on the wire.
         self.refresh_serial = 0
+        self._refresh_ready_seat = None
+        self._refresh_retry_counts = {}
         self.blocked_reason = ""
         self.terminal_code = None
         self.terminal_message = ""
@@ -426,6 +437,16 @@ class RequestGate:
 
     def mark_click(self, seat: str) -> None:
         self._click_started = (seat, perf_counter_ns())
+        self._click_fire_delta = ((time.monotonic() - self.fire_deadline) * 1000
+                                 if hasattr(self, "fire_deadline") else None)
+
+    def allow_refresh_retry(self, seat: str) -> bool:
+        """Called only after the runner reloads and validates the official page."""
+        if (not self.refresh_pending or seat != self.sent_seat
+                or self._refresh_retry_counts.get(seat, 0) >= REFRESH_RETRY_LIMIT):
+            return False
+        self._refresh_ready_seat = seat
+        return True
 
     def _mark_response(self, response) -> None:
         request = getattr(response, "request", None)
@@ -464,7 +485,10 @@ class RequestGate:
         if path != SUBMIT_PATH:
             # Prevent preview/manual clicks from cancelling, signing or renewing
             # another booking. Known read-only seat endpoints use POST as well.
-            if "/data/apps/seat/" in path and path.split("/data/apps/seat/", 1)[1] not in READ_SEAT_PATHS:
+            endpoint = path.split("/data/apps/seat/", 1)[-1]
+            readonly = endpoint in READ_SEAT_PATHS or (
+                endpoint in READ_SEAT_GET_PATHS and request.method.upper() == "GET")
+            if "/data/apps/seat/" in path and not readonly:
                 route.abort()
             else:
                 route.fallback()
@@ -483,7 +507,8 @@ class RequestGate:
         # An explicit platform unlock — a completed human challenge, or the
         # platform's own "refresh and resubmit" refusal — is the only way the
         # same seat may be sent twice. ``attempted`` itself is never relaxed.
-        continuation = (self.challenge_pending or self.refresh_pending) and self.armed_seat == self.sent_seat
+        refresh_ready = self.refresh_pending and self._refresh_ready_seat == self.armed_seat
+        continuation = (self.challenge_pending or refresh_ready) and self.armed_seat == self.sent_seat
         if (not self.armed_seat or self.pending or self.routing or
                 (self.armed_seat in self.attempted and not continuation)):
             route.abort()
@@ -517,6 +542,9 @@ class RequestGate:
             # It is the user's continuation of that challenge, not another
             # automatic candidate attempt.
             if continuation:
+                if refresh_ready:
+                    self._refresh_retry_counts[self.armed_seat] = self._refresh_retry_counts.get(self.armed_seat, 0) + 1
+                self._refresh_ready_seat = None
                 self.challenge_pending = False
                 self.challenge_message = ""
                 self.refresh_pending = False
@@ -545,6 +573,9 @@ class RequestGate:
                 }
                 if click_started_ns is not None:
                     timing["click_to_request_ms"] = (route_started_ns - click_started_ns) / 1_000_000
+                    if self._click_fire_delta is not None:
+                        timing["fire_to_click_ms"] = self._click_fire_delta
+                        timing["fire_to_request_ms"] = self._click_fire_delta + timing["click_to_request_ms"]
                 self.attempt_timings.append(timing)
 
     def response(self, response):
@@ -563,7 +594,8 @@ class RequestGate:
             if not isinstance(payload, dict) or payload.get("success") not in (False, "false", 0):
                 return
             message = str(payload.get("msg") or payload.get("message") or "")
-            if any(word in message for word in ("操作频繁", "过于频繁", "请勿频繁", "请求频繁", "稍后再试")):
+            risk = any(word in message for word in ("非法操作", "异常操作", "风险控制", "风控拦截", "访问被拒绝"))
+            if not risk and any(word in message for word in ("操作频繁", "过于频繁", "请勿频繁", "请求频繁", "稍后再试")):
                 safe_message = "官方提示操作频繁；已退避并继续检查下一候选"
                 if self.checkpoint("RUNNING", safe_message, False, self.sent_seat, "RATE_LIMITED"):
                     self.pending = False
@@ -573,7 +605,7 @@ class RequestGate:
                 else:
                     self.control.cancel.set()
                 return
-            if any(word in message for word in ("非法操作", "异常操作", "风险控制", "风控拦截", "访问被拒绝")):
+            if risk:
                 safe_message = "官方拒绝本次操作；已停止本次任务，不再换座或追加请求"
                 if self.checkpoint("BLOCKED_BY_RISK", safe_message, False, self.sent_seat, "BLOCKED_BY_RISK"):
                     self.pending = False
@@ -593,6 +625,7 @@ class RequestGate:
                 if self.checkpoint("RUNNING", safe_message, False, self.sent_seat, "TOKEN_STALE"):
                     self.pending = False
                     self.refresh_pending = True
+                    self._refresh_ready_seat = None
                     self.refresh_message = safe_message
                     self.refresh_serial += 1
                 else:
@@ -612,7 +645,7 @@ class RequestGate:
                     self.control.cancel.set()
                 return
             # Only an explicit seat rejection permits moving to another seat.
-            if any(word in message for word in ("已被预约", "已被别人预约", "座位不可预约", "座位已被", "座位被占用")):
+            if any(word in message for word in ("已被预约", "已被别人预约", "座位不可预约", "座位已被", "座位被占用", "该时间段已被占用")):
                 safe_message = "官方明确返回座位不可预约，准备检查下一候选"
                 if self.checkpoint("RUNNING", safe_message, False, self.sent_seat, "SEAT_UNAVAILABLE"):
                     self.pending = False
@@ -666,7 +699,7 @@ class PageAdapter:
             raise ValueError("页面没有完整对应的起止时段")
         first, last = starts[0], ends[0]
         if any(s["disabled"] for s in slots[first:last + 1]):
-            raise ValueError("目标时段包含不可选时间；请在官方页面核实")
+            raise CandidateUnavailable("目标时段包含不可选时间；检查下一候选座位")
         for left, right in zip(slots[first:last], slots[first + 1:last + 1]):
             if left["time"].split("-")[-1] != right["time"].split("-")[0]:
                 raise ValueError("目标时段不连续")
@@ -727,10 +760,14 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
             _controls.pop(run_id, None)
         return BrowserResult("SKIPPED", "DEADLINE_EXCEEDED", "已超过开抢后的 5 分钟等待上限，未启动预约")
     deadline = time.monotonic() + remaining
+    # Freeze a server-aligned monotonic deadline for this run. Wall-clock or
+    # calibration changes during the wait cannot move its submission boundary.
+    fire_deadline = deadline - BROWSER_RUN_SECONDS
     gate = RequestGate(
         values, day, preview or check_only or login_only,
         checkpoint, control, deadline, timing_sink,
     )
+    gate.fire_deadline = fire_deadline
     context = page = None
     fid = ""
     bound_identity = None
@@ -813,7 +850,7 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
         if not checking and (control.cancel.is_set() or time.monotonic() >= deadline):
             raise InterruptedError("已停止接管或等待超时")
         if not checking and page.is_closed():
-            raise InterruptedError("预约窗口已关闭")
+            raise BrowserWindowClosed("预约窗口已关闭")
         if bound_identity and not checking and identity() != bound_identity:
             raise InterruptedError("浏览器登录账号发生变化，已停止接管")
 
@@ -848,14 +885,14 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
         while time.monotonic() < until:
             if gate.terminal_code:
                 return BrowserResult("BLOCKED_BY_RISK", gate.terminal_code, gate.terminal_message)
-            if allow_challenge and gate.challenge_pending:
+            if allow_challenge and (gate.challenge_pending or gate.refresh_pending):
                 return None
             tick("VERIFYING", "正在核对官方预约记录，不会重复提交", checking=True)
             state, seat, detail = lookup(
                 timeout=max(1, min(5000, int((until - time.monotonic()) * 1000))),
                 previous_items=submission_baseline,
             )
-            if allow_challenge and gate.challenge_pending:
+            if allow_challenge and (gate.challenge_pending or gate.refresh_pending):
                 return None
             if state == "exact":
                 gate.armed_seat = None
@@ -942,8 +979,8 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                         if urlparse(page.url).hostname == 'office.chaoxing.com':
                             response = page.goto(ACCOUNT_URL, wait_until='domcontentloaded', timeout=15000)
                     checking_login = False
-                    if fire_epoch - clock.server_now() > 30:
-                        while fire_epoch - clock.server_now() > 30:
+                    if fire_deadline - time.monotonic() > 30:
+                        while fire_deadline - time.monotonic() > 30:
                             tick('WAITING_OPEN', '登录已就绪，等待开抢前 30 秒准备预约页面')
                             page.wait_for_timeout(250)
                         response = page.goto(ACCOUNT_URL, wait_until='domcontentloaded', timeout=15000)
@@ -958,6 +995,9 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                 refresh_retries: dict[str, int] = {}
                 while pending_seats:
                     seat = pending_seats.popleft()
+                    if seat != gate.sent_seat:
+                        gate.refresh_pending = False
+                        gate._refresh_ready_seat = None
                     gate.armed_seat = None
                     gate.rejected = False
                     gate.rejection_code = None
@@ -1010,7 +1050,7 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                                 # returning seat page its own full loading period.
                                 ready_until = time.monotonic() + 15
                         state = adapter.state()
-                        if not preview and not check_only and not refreshed_at_open and clock.server_now() >= fire_epoch and not (state and state.get("timesShow")):
+                        if not preview and not check_only and not refreshed_at_open and time.monotonic() >= fire_deadline and not (state and state.get("timesShow")):
                             # The pre-opening response is stale at the opening
                             # boundary. Fetch once before classifying it as closed.
                             refreshed_at_open = True
@@ -1035,10 +1075,10 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                             if preview:
                                 return BrowserResult("PROBE_DONE", "PROBE_WAITING_OPEN",
                                     f"官方提示当前区域未到开放预约时间；目标日期 {day}，计划执行时间 {values.get('run_time', '未配置')}。未提交预约；需开放后再完成选座演练。")
-                            if clock.server_now() >= fire_epoch and refreshed_at_open:
+                            if time.monotonic() >= fire_deadline and refreshed_at_open:
                                 return BrowserResult("FAILED", "TARGET_DAY_NOT_OPEN",
                                     f"官方提示目标日期 {day} 尚未开放预约；未提交预约")
-                        if not preview and clock.server_now() < fire_epoch:
+                        if not preview and time.monotonic() < fire_deadline:
                             tick("WAITING_OPEN", "已打开页面，等待预约窗口开放")
                             page.wait_for_timeout(250)
                             continue
@@ -1070,11 +1110,15 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                             return BrowserResult("NEEDS_VERIFICATION", "BROWSER_PRECHECK_FAILED", detail)
                     try:
                         button, fid = adapter.prepare(values, day, seat)
+                    except CandidateUnavailable as exc:
+                        last_rejection_code, last_rejection_message = "SEAT_UNAVAILABLE", str(exc)
+                        checkpoint("RUNNING", f"座位 {seat}：{exc}", False, seat, "SEAT_UNAVAILABLE")
+                        continue
                     except ValueError as exc:
                         return BrowserResult("NEEDS_VERIFICATION", "BROWSER_PAGE_UNSUPPORTED", str(exc))
                     if preview:
                         continue  # never click submit, even with the gate installed
-                    while clock.server_now() < fire_epoch:
+                    while time.monotonic() < fire_deadline:
                         tick("WAITING_OPEN", f"座位 {seat} 和时段已准备，等待开抢")
                         page.wait_for_timeout(250)
                     # Deliberately NO reservation-list lookup here. The official
@@ -1091,8 +1135,15 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                     # the post-submit reconciliation.
                     submission_baseline = last_lookup_items
                     # Re-read all selected values after waiting/user interaction.
-                    button, fid = adapter.prepare(values, day, seat)
+                    try:
+                        button, fid = adapter.prepare(values, day, seat)
+                    except CandidateUnavailable as exc:
+                        last_rejection_code, last_rejection_message = "SEAT_UNAVAILABLE", str(exc)
+                        checkpoint("RUNNING", f"座位 {seat}：{exc}", False, seat, "SEAT_UNAVAILABLE")
+                        continue
                     tick("RUNNING", f"准备预约座位 {seat}")
+                    if gate.refresh_pending and gate.sent_seat == seat and not gate.allow_refresh_retry(seat):
+                        return BrowserResult("FAILED", "TOKEN_STALE", "页面刷新重试次数已达上限")
                     gate.armed_seat = seat
                     gate.mark_click(seat)
                     button.click(timeout=3000)
@@ -1182,12 +1233,18 @@ def _run_browser_impl(run_id, account_id, values, day, fire_epoch, checkpoint, *
                         continue
                     return result
                 if preview:
+                    if last_rejection_code:
+                        return BrowserResult("PROBE_DONE", "PROBE_SEAT_UNAVAILABLE", "演练中发现不可用候选：" + last_rejection_message + "；未提交预约")
                     return BrowserResult("PROBE_DONE", "BROWSER_PREVIEW_READY", "浏览器演练通过：候选座位、日期、时段及提交控件均已检查；未提交预约")
                 return BrowserResult(
                     "FAILED",
                     last_rejection_code or "SEAT_UNAVAILABLE",
                     last_rejection_message or "官方明确拒绝了所有候选座位",
                 )
+            except BrowserWindowClosed as exc:
+                if gate.pending or gate.terminal_code:
+                    return reconcile()
+                return BrowserResult("SKIPPED", "BROWSER_WINDOW_CLOSED", str(exc))
             except InterruptedError as exc:
                 if gate.pending or gate.terminal_code:
                     return reconcile()

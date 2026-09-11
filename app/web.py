@@ -17,16 +17,16 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import desc, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from .chaoxing_client import EPHEMERAL_SELECT_KEYS, normalize_select_context_path, parse_select_context_url
 from . import clock, notify
 from .db import Account, PlanSeat, ReservationPlan, ReservationRun, get_db, init_db
-from .scheduler import LEAD_SECONDS, _enqueue_recently_missed_jobs, refresh_jobs, scheduler, start_scheduler, stop_scheduler
+from .scheduler import LEAD_SECONDS, _enqueue_recently_missed_jobs, refresh_jobs, scheduler, start_scheduler, stop_scheduler, catchup_status
 from .security import encrypt_password
-from .service import active_run_count, enqueue_plan, enqueue_login, recover_interrupted_runs
+from .service import active_run_count, enqueue_plan, enqueue_login, recover_interrupted_runs, cancel_pending_run
 from .validation import normalize_time, validate_reservation_time_range
-from .run_state import ACTIVE_STATUSES
+from .run_state import ACTIVE_STATUSES, SCHEDULED_TRIGGERS, scheduled_opening, weekday_name
 from . import browser_reserve
 from .browser_acceptance import acceptance as browser_acceptance
 from . import browser_sessions
@@ -279,7 +279,7 @@ def _next_run_at(plan: ReservationPlan, now: dt.datetime | None = None) -> str |
     once kept promising an execution the scheduler had already moved to
     tomorrow (2026-09-03 incident); the UI now prefers this server value.
     """
-    if not plan.enabled or not scheduler.running:
+    if not plan.enabled or not scheduler.running or not getattr(getattr(plan, "account", None), "enabled", True):
         return None
     # Cron wakes before the configured opening. If a plan is created or edited
     # after that preparation point, its recurring cron occurrence is tomorrow,
@@ -288,15 +288,21 @@ def _next_run_at(plan: ReservationPlan, now: dt.datetime | None = None) -> str |
     # reservation is tomorrow.
     current = now or dt.datetime.now(ZoneInfo("Asia/Shanghai"))
     try:
-        hour, minute = map(int, plan.run_time.split(":", 1))
-        opening = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        opening = scheduled_opening(plan.run_time, current, LEAD_SECONDS)
         awaiting_current_opening = (
-            opening.strftime("%A") in plan.weekdays
+            weekday_name(opening) in plan.weekdays
             and opening - dt.timedelta(seconds=LEAD_SECONDS) <= current
             <= opening
         )
-        if awaiting_current_opening:
-            return opening.isoformat()
+        if awaiting_current_opening and hasattr(plan, "_sa_instance_state"):
+            db = object_session(plan)
+            if db:
+                runs = db.scalars(select(ReservationRun).where(
+                    ReservationRun.plan_id == plan.id, ReservationRun.account_id == plan.account_id,
+                    ReservationRun.status.in_(ACTIVE_STATUSES),
+                    ReservationRun.trigger.in_(SCHEDULED_TRIGGERS)))
+                if any(run.request_snapshot.get("opening_at") == opening.isoformat() for run in runs):
+                    return opening.isoformat()
     except (AttributeError, TypeError, ValueError):
         pass
     try:
@@ -327,6 +333,8 @@ def _plan_json(plan: ReservationPlan) -> dict:
         "select_params": plan.select_params,
         "context_status": "ready" if plan.select_params else "not_checked",
         "next_run_at": _next_run_at(plan),
+        "account_enabled": plan.account.enabled,
+        "schedule_status": catchup_status(plan),
         # Request and response use the same canonical names.  Keep the old
         # aliases temporarily for older local browser tabs.
         "select_context_source": plan.select_context_source,
@@ -647,6 +655,8 @@ def _browser_command(run_id, action, db):
     run = db.get(ReservationRun, run_id)
     if not run:
         raise HTTPException(404, "运行记录不存在")
+    if action == "cancel" and run.status == "PENDING" and cancel_pending_run(run_id):
+        return {"accepted": True}
     if run.status not in ACTIVE_STATUSES or not browser_reserve.command(run_id, action):
         raise HTTPException(409, "浏览器任务尚未启动或已经结束")
     return {"accepted": True}

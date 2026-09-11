@@ -71,7 +71,7 @@ def test_passport_identity_is_available_before_office_app_opens():
 
 class Route:
     def __init__(self, params=None, path=br.SUBMIT_PATH, query=""):
-        self.request = SimpleNamespace(url=br.ORIGIN + path + query, post_data=urlencode(params or {}))
+        self.request = SimpleNamespace(url=br.ORIGIN + path + query, post_data=urlencode(params or {}), method="POST")
         self.result = None
 
     def fallback(self):
@@ -180,6 +180,7 @@ def test_target_closed_detection_survives_broken_page_probe():
 @pytest.mark.parametrize("message,code,terminal", [
     ("操作频繁，请稍后再试", "RATE_LIMITED", False),
     ("检测到异常操作，风控拦截", "BLOCKED_BY_RISK", True),
+    ("检测到异常操作，请稍后再试", "BLOCKED_BY_RISK", True),
 ])
 def test_rate_limit_is_retryable_but_explicit_risk_is_terminal(message, code, terminal):
     checkpoints = []
@@ -215,11 +216,18 @@ def test_refresh_rejection_arms_one_same_seat_retry_without_loosening_attempted(
     # though the wording contains 安全验证.
     assert gate.refresh_pending and gate.refresh_serial == 1
     assert not gate.challenge_pending and not gate.rejected and not gate.terminal_code
+    premature = Route(intent())
+    gate.route(premature)
+    assert premature.result == "blocked"
+    assert gate.allow_refresh_retry("097")
     retry = Route(intent())
     gate.route(retry)
     assert retry.result == "sent" and not gate.refresh_pending
     # Unlock consumed: pending cleared, a third send for the same seat is still
     # refused by the attempted guard.
+    gate.response(SimpleNamespace(url=br.ORIGIN + br.SUBMIT_PATH,
+                                json=lambda: {"success": False, "msg": "请刷新页面"}))
+    assert not gate.allow_refresh_retry("097")
     gate.pending = False
     gate.sent_seat = "097"
     third = Route(intent())
@@ -344,6 +352,19 @@ def test_request_gate_registration_is_narrow_and_reversible():
     assert [item[1] for item in calls[:count]] == list(br.REQUEST_GATE_PATTERNS)
     assert [item[1] for item in calls[count:]] == list(br.REQUEST_GATE_PATTERNS)
     assert all(item[1] != "**/*" for item in calls)
+
+
+@pytest.mark.parametrize("path,method,allowed", [
+    ("getdrawseat", "GET", True), ("seatgrid/roomid", "GET", True),
+    ("getdrawseat", "POST", False), ("seatgrid/roomid", "DELETE", False),
+    ("cancel", "GET", False), ("sign", "POST", False), ("renew", "POST", False),
+])
+def test_gate_allows_official_readonly_seat_grid_only(path, method, allowed):
+    gate = make_gate(preview=True)
+    route = Route(path="/data/apps/seat/" + path)
+    route.request.method = method
+    gate.route(route)
+    assert route.result == ("sent" if allowed else "blocked")
 
 
 def test_real_persistent_browser_launch(tmp_path):
@@ -708,6 +729,8 @@ def test_official_not_open_notice_is_not_a_login_or_adapter_failure(page_fixture
     ("rate_response", "FAILED"), ("rate_then_success", "SUCCESS"),
     ("stale_plain", "FAILED"), ("stale_security", "SUCCESS"),
     ("stale_redirect", "NEEDS_VERIFICATION"),
+    ("disabled_first", "SUCCESS"), ("occupied_message", "SUCCESS"),
+    ("late_stale_security", "SUCCESS"),
     ("risk_response", "BLOCKED_BY_RISK")])
 def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, monkeypatch, mode, expected):
     page, context, sent = page_fixture
@@ -722,7 +745,7 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
         @property
         def request(self):
             def get(*args, **kwargs):
-                if mode == "late_response_captcha" and late_response["response"] is not None and not late_response["released"]:
+                if mode in {"late_response_captcha", "late_stale_security"} and late_response["response"] is not None and not late_response["released"]:
                     late_response["released"] = True
                     original_gate_response(late_response["gate"], late_response["response"])
                 items = [record(seatNum="098" if mode == "rate_then_success" else "097")] if mode == "existing_disabled" or (sent and mode in {"success", "scheduled_open", "early_captcha", "direct_submit", "scheduled_direct", "scheduled_stale_date"}) or (mode in {"response_captcha", "late_response_captcha", "rate_then_success", "stale_security"} and len(sent) >= 2) else []
@@ -741,8 +764,10 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
                     items = [record(
                         startTime=int(dt.datetime(2026, 9, 10, 8, 0, tzinfo=tz).timestamp() * 1000),
                         endTime=int(dt.datetime(2026, 9, 10, 9 if sent else 8, 30, tzinfo=tz).timestamp() * 1000))]
-                if mode == 'seat_fallback' and len(sent) == 2:
+                if mode in {'seat_fallback', 'occupied_message'} and len(sent) == 2 or mode == 'disabled_first' and sent:
                     items = [record(seatNum='098')]
+                if mode == 'late_stale_security' and len(sent) >= 2:
+                    items = [record()]
                 return SimpleNamespace(status=200, json=lambda: {"success": True, "data": {"curReserves": items}})
             return SimpleNamespace(get=get)
     class Runtime:
@@ -764,15 +789,18 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
     monkeypatch.setattr(br, "VERIFY_SECONDS", 0.1)
     if mode == 'list_delay':
         monkeypatch.setattr(br, "VERIFY_SECONDS", 3)
-    if mode == 'seat_fallback':
+    if mode in {'seat_fallback', 'disabled_first', 'occupied_message'}:
         def candidate_page(route):
             seat = parse_qs(urlparse(route.request.url).query)['seatNum'][0]
-            route.fulfill(body=HTML.replace("chosedSeatNum:'097'", f"chosedSeatNum:'{seat}'"), content_type='text/html')
+            html = HTML.replace("chosedSeatNum:'097'", f"chosedSeatNum:'{seat}'")
+            if mode == 'disabled_first' and seat == '097':
+                html = html.replace("cls:''", "cls:'noSelect'")
+            route.fulfill(body=html, content_type='text/html')
         context.route(br.ORIGIN + '/front/third/apps/seat/select?**', candidate_page)
         def rejection_then_success(route):
             sent.append(route.request.post_data)
             rejected = parse_qs(route.request.post_data)['seatNum'][0] == '097'
-            route.fulfill(json={'success':not rejected, 'msg':'座位已被预约' if rejected else '成功'})
+            route.fulfill(json={'success':not rejected, 'msg':('该时间段已被占用！' if mode == 'occupied_message' else '座位已被预约') if rejected else '成功'})
         context.route(br.ORIGIN + br.SUBMIT_PATH, rejection_then_success)
     if mode in {'response_captcha', 'late_response_captcha'}:
         challenge_html = HTML.replace(
@@ -800,7 +828,7 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
                 message = "操作频繁，请稍后再试" if mode != 'risk_response' else "检测到异常操作，风控拦截"
                 route.fulfill(json={"success": False, "msg": message})
         context.route(br.ORIGIN + br.SUBMIT_PATH, reject_for_risk)
-    if mode in {'stale_plain', 'stale_security', 'stale_redirect'}:
+    if mode in {'stale_plain', 'stale_security', 'stale_redirect', 'late_stale_security'}:
         # P0: the platform's 303 remedy ("page sat too long, refresh and
         # resubmit"). Three real-world shapes are probed here because the gate
         # classifies on message text: the platform's wording contains
@@ -812,7 +840,7 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
             sent.append(route.request.post_data)
             if mode == 'stale_redirect':
                 route.fulfill(status=303, headers={"Location": "https://passport2.chaoxing.com/login"})
-            elif mode == 'stale_security' and len(sent) >= 2:
+            elif mode in {'stale_security', 'late_stale_security'} and len(sent) >= 2:
                 route.fulfill(json={"success": True, "msg": "成功"})
             else:
                 route.fulfill(json={"success": False, "msg": stale_message})
@@ -826,7 +854,7 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
                       lambda route: route.fulfill(body=direct_html, content_type='text/html'))
     late_response = {"gate": None, "response": None, "released": False}
     original_gate_response = br.RequestGate.response
-    if mode == 'late_response_captcha':
+    if mode in {'late_response_captcha', 'late_stale_security'}:
         def hold_first_challenge(gate, response):
             if (response.url.endswith(br.SUBMIT_PATH) and
                     response.json().get("success") is False and
@@ -838,6 +866,10 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
         monkeypatch.setattr(br.RequestGate, "response", hold_first_challenge)
     monkeypatch.setattr(playwright.sync_api, "sync_playwright", Runtime)
     server_now = [time.time()]
+    clock_advance = [0.0]
+    if mode in {"scheduled_open", "scheduled_direct", "scheduled_stale_date"}:
+        monkeypatch.setattr(br, "time", SimpleNamespace(
+            monotonic=lambda: time.monotonic() + clock_advance[0], sleep=time.sleep))
     fire_epoch = server_now[0] + (30 if mode in {"scheduled_open", "scheduled_direct", "scheduled_stale_date"} else 0)
     monkeypatch.setattr(br.clock, "server_now", lambda: server_now[0])
     navigations = []
@@ -875,6 +907,7 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
         if mode in {"scheduled_open", "scheduled_direct", "scheduled_stale_date"} and status == "WAITING_OPEN":
             assert not sent
             server_now[0] = fire_epoch + 0.1
+            clock_advance[0] = 30.1
         if mode == "early_captcha" and status == "WAITING_USER" and "官方页面出现安全验证" in message:
             assert len(navigations) == 1 and not sent
             assert page.evaluate("v.dynamicChosedTimeInfo.startTime") == ''
@@ -902,7 +935,7 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
                 page.close()
             elif mode in {"response_captcha", "late_response_captcha"} and len(sent) == 1:
                 page.locator("#human").click()
-            elif not sent or mode in {'rate_then_success', 'stale_security', 'stale_plain'} or (mode == 'seat_fallback' and len(sent) == 1):
+            elif not sent or mode in {'rate_then_success', 'stale_security', 'stale_plain', 'late_stale_security'} or (mode in {'seat_fallback', 'occupied_message'} and len(sent) == 1):
                 # rate_then_success / stale_* must let the human step fire on
                 # every attempt: the first seat is throttled or refused with
                 # "refresh and resubmit", and the follow-up attempt (after the
@@ -911,12 +944,13 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
                 page.locator("#human").click()
         return True
     values = {**VALUES, "seats": ["097"], "username": "user"}
-    if mode in {'seat_fallback', 'rate_then_success'}:
+    if mode in {'seat_fallback', 'rate_then_success', 'disabled_first', 'occupied_message'}:
         values['seats'] = ['097', '098']
     result = br.run_browser(42, 1, values, DAY, fire_epoch, checkpoint,
                            preview=mode == "preview" or mode.startswith("qr_"), check_only=mode == "recheck")
     assert result.status == expected, result
-    stale_sends = {'stale_plain': 2, 'stale_redirect': 1, 'stale_security': 2}
+    stale_sends = {'stale_plain': 2, 'stale_redirect': 1, 'stale_security': 2,
+                   'late_stale_security': 2, 'disabled_first': 1, 'occupied_message': 2}
     if mode in stale_sends:
         assert len(sent) == stale_sends[mode], (mode, len(sent))
     else:
@@ -971,6 +1005,13 @@ def test_full_browser_runner_with_simulated_transport(page_fixture, tmp_path, mo
         assert result.code == "BLOCKED_BY_RISK"
     if mode == "recheck":
         assert result.code == "BROWSER_CHECK_ABSENT"
+    if mode == "disabled_first":
+        assert parse_qs(sent[0])["seatNum"] == ["098"]
+    if mode == "late_stale_security":
+        assert late_response["released"]
+        assert all(parse_qs(body)["seatNum"] == ["097"] for body in sent)
+    if mode == "close":
+        assert result.code == "BROWSER_WINDOW_CLOSED"
     if mode == "login":
         assert ("WAITING_LOGIN", None) in seen
     if mode.startswith("qr_"):

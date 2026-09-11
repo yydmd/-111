@@ -93,6 +93,14 @@ def _dispatch(cfg: dict, title: str, body: str) -> str | None:
         return exc.__class__.__name__
     if response.status_code >= 400:
         return f"HTTP {response.status_code}"
+    try:
+        payload = response.json()
+    except ValueError:
+        return "通知平台返回无法识别的响应"
+    field, expected = ("errcode", 0) if kind == "wecom_webhook" else ("code", 200 if kind == "bark" else 0)
+    if not isinstance(payload, dict) or type(payload.get(field)) is not int or payload[field] != expected:
+        # Never echo provider bodies: some providers include the secret URL.
+        return "通知平台未确认发送成功，请检查密钥或平台额度"
     return None
 
 

@@ -52,6 +52,7 @@ _lock = threading.Lock()
 _offset = 0.0
 _measured_at = 0.0
 _last_error = ""
+_refresh_running = False
 
 # requests.Session is not documented as thread-safe and probes carry Set-Cookie
 # updates into a shared jar; concurrent scheduled runs each probe through
@@ -73,12 +74,14 @@ def _measure_once(url: str, budget: float) -> tuple[float, float] | None:
     before = time.time()
     response = _probe_session().get(
         url,
-        timeout=(max(0.5, min(2.0, budget)), max(0.5, min(4.0, budget))),
+        timeout=(max(0.1, min(2.0, budget / 2)), max(0.1, budget / 2)),
         allow_redirects=False,
+        stream=True,
         headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"},
     )
     after = time.time()
     raw_date = response.headers.get("Date", "")
+    response.close()  # Date headers suffice; never wait for the response body.
     if not raw_date:
         return None
     try:
@@ -134,21 +137,46 @@ def refresh(dense: bool = False, budget_seconds: float | None = None) -> float:
         return _offset
 
 
+def refresh_async() -> None:
+    """Single-flight background refresh; timing-critical readers never do IO."""
+    global _refresh_running
+    with _lock:
+        if _refresh_running:
+            return
+        _refresh_running = True
+    def worker():
+        global _refresh_running
+        try:
+            refresh()
+        except Exception:
+            logger.exception("background clock calibration failed")
+        finally:
+            with _lock:
+                _refresh_running = False
+    try:
+        threading.Thread(target=worker, name="clock-refresh", daemon=True).start()
+    except Exception:
+        with _lock:
+            _refresh_running = False
+        raise
+
+
 def server_offset() -> float:
-    """Current best offset (server time - local time), refreshed when stale."""
+    """Cached best offset; request background calibration when stale."""
     with _lock:
         age = time.time() - _measured_at
         ttl = FAILURE_RETRY_SECONDS if _last_error else TTL_SECONDS
         stale = age > ttl or (_measured_at == 0.0)
     if stale:
-        refresh()
+        refresh_async()
     with _lock:
         return _offset
 
 
 def server_now() -> float:
     """Epoch seconds on the platform's clock."""
-    return time.time() + server_offset()
+    offset = server_offset()
+    return time.time() + offset
 
 
 def server_time_of_day_minutes(now_epoch: float | None = None) -> float:
@@ -167,4 +195,4 @@ def status() -> dict:
 
 def warm_start() -> None:
     """Measure once in the background so service startup stays fast."""
-    threading.Thread(target=refresh, name="clock-warm", daemon=True).start()
+    refresh_async()

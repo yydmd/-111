@@ -1,8 +1,7 @@
 """Standalone verification of the bot-race upgrade (no pytest machinery).
 
-The DSH sandbox denies directory scanning for pytest's tmp_path machinery and
-tempfile.TemporaryDirectory, so this script uses its own sqlite files under
-data/ and avoids listing directories altogether. Run:
+Legacy API/shared-logic checks, not acceptance of the production browser path.
+SQLite fixtures live in an automatically cleaned temporary directory. Run:
 
     .venv\\Scripts\\python.exe tests\\upgrade_check.py
 """
@@ -10,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import time
+from tempfile import TemporaryDirectory
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,6 +24,7 @@ from app.db import Account, Base, PlanSeat, ReservationPlan, ReservationRun  # n
 CHECKS: list[str] = []
 DATA = Path(__file__).resolve().parents[1] / "data"
 RUN_TAG = f"{int(time.time())}"
+ENGINES = []
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -31,26 +32,16 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def usable_dir(base: Path, name: str) -> Path:
-    """Create a directory the sandbox actually lets us use (some fresh dirs
-    are born access-denied; cycle names until one works)."""
-    base.mkdir(parents=True, exist_ok=True)
-    for index in range(30):
-        candidate = base / f"{name}{index}"
-        candidate.mkdir(exist_ok=True)
-        probe = candidate / ".probe"
-        try:
-            probe.write_text("ok")
-            probe.unlink()
-            return candidate
-        except OSError:
-            continue
-    raise RuntimeError(f"no usable directory under {base}")
+    candidate = base / name
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
 
 
 def make_factory(root: Path, name: str):
     # Unique per-run directory: a stale check.db from an earlier run would
     # trip the duplicate-reservation guard and skew the scenarios.
     engine = create_engine(f"sqlite:///{usable_dir(root, f'{name}-{RUN_TAG}') / 'check.db'}", connect_args={"check_same_thread": False})
+    ENGINES.append(engine)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
@@ -626,7 +617,7 @@ def scenario_constants() -> None:
     check("ui-clamps-seven-to-six", clamped)
 
 
-def main() -> int:
+def run_checks() -> int:
     scenario_serial_no_repeat()
     scenario_budget_clamp()
     scenario_parallel_winner()
@@ -647,6 +638,18 @@ def main() -> int:
     failures = [line for line in CHECKS if line.startswith("FAIL")]
     print(f"\n{len(CHECKS) - len(failures)}/{len(CHECKS)} checks passed")
     return 1 if failures else 0
+
+
+def main() -> int:
+    global DATA
+    with TemporaryDirectory(prefix="chaoxing-upgrade-check-") as directory:
+        DATA = Path(directory)
+        try:
+            return run_checks()
+        finally:
+            for engine in ENGINES:
+                engine.dispose()
+            ENGINES.clear()
 
 
 if __name__ == "__main__":
